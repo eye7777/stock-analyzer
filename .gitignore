@@ -1,0 +1,31 @@
+# ==========================================
+# 絕對不能上傳到 GitHub 的檔案
+# ==========================================
+
+# 敏感資料（最重要！）
+.env
+*.env
+
+# 執行日誌（每次都會重新產生）
+*.log
+launchd_out.log
+launchd_err.log
+
+# Mac 本機排程設定（雲端不需要）
+*.plist
+run_analyzer.sh
+setup_schedule.sh
+
+# Python 暫存檔
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+
+# macOS 系統檔
+.DS_Store
+.AppleDouble
+
+# 編輯器暫存
+.vscode/
+*.swp
