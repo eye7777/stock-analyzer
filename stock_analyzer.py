@@ -476,8 +476,14 @@ def analyze_with_claude(stocks_data: list, market_data: dict) -> dict:
     for block in message.content:
         if block.type == "tool_use" and block.name == "output_analysis":
             result = block.input
+            # ── 強制用 STOCKS 字典覆蓋公司名稱 ──────────────────────
+            # Claude 有時會產生錯誤名稱（如「田勝明」→「晟銘電」），
+            # 以 stock_id 為 key 強制寫入正確名稱，AI 無法覆蓋
+            for s in result.get("stocks", []):
+                sid = s.get("stock_id", "")
+                if sid in STOCKS:
+                    s["name"] = STOCKS[sid]   # ← 永遠用這裡的正確名稱
             log.info(f"  Claude 回傳 {len(result.get('stocks', []))} 檔評分結果")
-            # 記錄每檔分數供除錯
             for s in result.get("stocks", []):
                 log.info(f"    {s.get('name','?')}({s.get('stock_id','?')}): "
                          f"總={s.get('total_score','?')} 基={s.get('fundamental_score','?')} "
