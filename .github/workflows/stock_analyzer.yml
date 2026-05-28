@@ -3,49 +3,50 @@ name: 📊 台股 AI 每日分析
 # ── 執行時機 ──────────────────────────────────────────────────
 on:
   schedule:
-    # 台灣時間 07:30 = UTC 23:30（前一天）
-    # cron 格式：分 時 日 月 星期（週一=1，週五=5）
-    - cron: '30 23 * * 0-4'   # UTC 週日~週四 23:30 = 台灣週一~週五 07:30
+    # 台灣時間 07:33 = UTC 前一天 23:33
+    # 刻意避開 :00/:15/:30/:45 — 那些是 GitHub 尖峰時段，最容易延遲或被跳過
+    #
+    # UTC 星期對照（cron 0=週日）：
+    #   UTC 週日(0) 23:33 → 台灣 週一 07:33
+    #   UTC 週一(1) 23:33 → 台灣 週二 07:33
+    #   UTC 週二(2) 23:33 → 台灣 週三 07:33
+    #   UTC 週三(3) 23:33 → 台灣 週四 07:33
+    #   UTC 週四(4) 23:33 → 台灣 週五 07:33
+    - cron: '33 23 * * 0-4'
 
-  workflow_dispatch:           # ← 允許在 GitHub 網頁手動觸發（方便測試）
+  # 手動觸發（GitHub 網頁上點 Run workflow 按鈕）
+  workflow_dispatch:
 
 # ── 工作定義 ──────────────────────────────────────────────────
 jobs:
   run-stock-analysis:
     name: 抓取台股資料並寄送 AI 分析報告
-    runs-on: ubuntu-latest      # 使用 GitHub 免費 Linux 伺服器
+    runs-on: ubuntu-latest
 
     steps:
-      # 步驟 1：下載程式碼
       - name: ① 下載程式碼
         uses: actions/checkout@v4
 
-      # 步驟 2：安裝 Python 3.11
       - name: ② 設定 Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'          # 快取套件，加快後續執行速度
+          cache: 'pip'
 
-      # 步驟 3：安裝所需套件
       - name: ③ 安裝套件
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
 
-      # 步驟 4：執行分析（敏感資料從 GitHub Secrets 注入）
       - name: ④ 執行台股 AI 分析
         env:
-          FINMIND_TOKEN:    ${{ secrets.FINMIND_TOKEN }}
+          FINMIND_TOKEN:     ${{ secrets.FINMIND_TOKEN }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          GMAIL_USER:       ${{ secrets.GMAIL_USER }}
-          GMAIL_PASSWORD:   ${{ secrets.GMAIL_PASSWORD }}
-          RECIPIENT_EMAIL:  ${{ secrets.RECIPIENT_EMAIL }}
+          GMAIL_USER:        ${{ secrets.GMAIL_USER }}
+          GMAIL_PASSWORD:    ${{ secrets.GMAIL_PASSWORD }}
+          RECIPIENT_EMAIL:   ${{ secrets.RECIPIENT_EMAIL }}
         run: python stock_analyzer.py
 
-      # 步驟 5：若失敗，印出錯誤日誌
       - name: ⑤ 顯示執行日誌（失敗時）
         if: failure()
-        run: |
-          echo "=== 執行失敗，印出最後 50 行日誌 ==="
-          tail -50 analyzer.log 2>/dev/null || echo "無日誌檔案"
+        run: tail -50 analyzer.log 2>/dev/null || echo "無日誌檔案"
