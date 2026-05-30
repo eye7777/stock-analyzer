@@ -21,6 +21,12 @@ import requests
 from dotenv import load_dotenv
 import anthropic
 
+try:
+    import yfinance as yf
+    HAS_YFINANCE = True
+except ImportError:
+    HAS_YFINANCE = False
+
 # ══════════════════════════════════════════════════════════════
 # 載入環境變數
 # ══════════════════════════════════════════════════════════════
@@ -93,6 +99,153 @@ def finmind_get(dataset: str, stock_id: str, start_date: str) -> pd.DataFrame:
     except Exception as e:
         log.warning(f"FinMind API 呼叫失敗 ({dataset}, {stock_id}): {e}")
         return pd.DataFrame()
+
+
+# ══════════════════════════════════════════════════════════════
+# 美股數據（yfinance）
+# ══════════════════════════════════════════════════════════════
+
+US_SYMBOLS = {
+    "SOX":  ("^SOX",  "費半"),
+    "IXIC": ("^IXIC", "納斯達克"),
+    "NVDA": ("NVDA",  "NVIDIA"),
+    "AMD":  ("AMD",   "AMD"),
+}
+
+
+def get_us_market_data() -> dict:
+    """使用 yfinance 抓取美股前一交易日收盤數據"""
+    log.info("抓取美股數據（yfinance）...")
+
+    if not HAS_YFINANCE:
+        log.warning("⚠️  yfinance 未安裝，跳過美股數據")
+        return {}
+
+    result = {}
+    for key, (ticker, label) in US_SYMBOLS.items():
+        try:
+            hist = yf.Ticker(ticker).history(period="5d")
+            if len(hist) < 2:
+                raise ValueError("資料筆數不足")
+            prev  = float(hist["Close"].iloc[-2])
+            last  = float(hist["Close"].iloc[-1])
+            chg_p = (last - prev) / prev * 100 if prev else 0.0
+            result[key] = {
+                "label":   label,
+                "close":   round(last, 2),
+                "chg_pct": round(chg_p, 2),
+                "chg_str": f"{'+' if chg_p >= 0 else ''}{chg_p:.2f}%",
+            }
+            log.info(f"  ✅ {label}（{ticker}）：{result[key]['close']}  {result[key]['chg_str']}")
+        except Exception as e:
+            log.warning(f"  ⚠️  yfinance 抓取 {ticker} 失敗：{e}")
+            result[key] = {"label": label, "close": "N/A", "chg_pct": 0.0, "chg_str": "N/A"}
+
+    return result
+
+
+# ══════════════════════════════════════════════════════════════
+# 美股新聞分析（Claude web_search）
+# ══════════════════════════════════════════════════════════════
+
+_SEARCH_KEYWORDS = [
+    "AI 伺服器 台股",
+    "半導體 重大消息",
+    "NVIDIA AMD 最新",
+    "SpaceX Anthropic AI",
+]
+
+
+def get_us_news_analysis(us_data: dict) -> dict:
+    """兩步驟：① Claude web_search 搜尋新聞；② 結構化輸出影響分析"""
+    log.info("使用 Claude web_search 搜尋最新財經新聞...")
+
+    client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+    stocks_list = "、".join(f"{n}({sid})" for sid, n in STOCKS.items())
+    us_summary  = "、".join(
+        f"{v['label']} {v['chg_str']}" for v in us_data.values() if isinstance(v, dict)
+    ) or "（美股數據未取得）"
+
+    # ── 步驟一：web_search 搜尋 ────────────────────────────────
+    keywords_str = "\n".join(f'{i+1}. "{kw}"' for i, kw in enumerate(_SEARCH_KEYWORDS))
+    search_prompt = (
+        f"請搜尋以下關鍵字的今日最新財經新聞：\n{keywords_str}\n\n"
+        f"昨夜美股：{us_summary}\n\n"
+        "搜尋後請整理出最重要的 2-3 則新聞標題與摘要。"
+    )
+
+    news_text = ""
+    try:
+        search_resp = client.beta.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=3000,
+            tools=[{"type": "web_search_20250305", "name": "web_search"}],
+            messages=[{"role": "user", "content": search_prompt}],
+            betas=["web-search-2025-03-05"],
+        )
+        for block in search_resp.content:
+            if hasattr(block, "text"):
+                news_text += block.text
+        log.info(f"  web_search 完成，取得 {len(news_text)} 字")
+    except Exception as e:
+        log.warning(f"  Claude web_search 失敗：{e}")
+        news_text = f"新聞搜尋失敗（{e}）"
+
+    # ── 步驟二：結構化分析 ──────────────────────────────────────
+    analysis_prompt = (
+        f"根據以下新聞內容和美股數據，分析對台股的影響。\n\n"
+        f"【昨夜美股】{us_summary}\n\n"
+        f"【新聞內容】\n{news_text[:3000]}\n\n"
+        f"請呼叫 output_news_analysis 工具，輸出：\n"
+        f"1. 2-3 則最重要的新聞，說明各自對哪些台股標的有影響（{stocks_list}）\n"
+        f"2. 今日開盤前一句話提示（30 字以內）"
+    )
+
+    output_tools = [{
+        "name": "output_news_analysis",
+        "description": "輸出結構化新聞分析結果",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "news_items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "title":           {"type": "string", "description": "新聞標題（25字內）"},
+                            "summary":         {"type": "string", "description": "新聞摘要（60字內）"},
+                            "affected_stocks": {"type": "string", "description": "影響的台股標的及說明"},
+                            "impact":          {"type": "string", "enum": ["正面", "負面", "中性"]},
+                        },
+                        "required": ["title", "summary", "affected_stocks", "impact"],
+                    },
+                },
+                "key_alert": {"type": "string", "description": "今日開盤前最重要提示（30字內）"},
+            },
+            "required": ["news_items", "key_alert"],
+        },
+    }]
+
+    try:
+        analysis_resp = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=2000,
+            tools=output_tools,
+            tool_choice={"type": "tool", "name": "output_news_analysis"},
+            messages=[{"role": "user", "content": analysis_prompt}],
+        )
+        for block in analysis_resp.content:
+            if block.type == "tool_use" and block.name == "output_news_analysis":
+                result = block.input
+                log.info(f"  ✅ 新聞分析完成：{len(result.get('news_items', []))} 則")
+                return result
+    except Exception as e:
+        log.warning(f"  新聞結構化分析失敗：{e}")
+
+    return {
+        "news_items": [],
+        "key_alert": "新聞分析暫時無法取得，請自行留意盤前消息",
+    }
 
 
 # ══════════════════════════════════════════════════════════════
@@ -498,11 +651,94 @@ def analyze_with_claude(stocks_data: list, market_data: dict) -> dict:
 # Email 組合與寄送
 # ══════════════════════════════════════════════════════════════
 
-def compose_email_html(analysis: dict, stocks_data: list, today_str: str, market_data: dict = None) -> str:
+def _build_us_section(us_market: dict, news_analysis: dict) -> str:
+    """組裝「零、昨夜美股與重大消息」HTML 區塊"""
+    GREEN = "#27ae60"
+    RED   = "#e74c3c"
+    GRAY  = "#888888"
+
+    # ── 美股數據格子 ──────────────────────────────────────────
+    us_cells = ""
+    for key in ("SOX", "IXIC", "NVDA", "AMD"):
+        info = us_market.get(key, {})
+        label   = info.get("label", key)
+        chg_str = info.get("chg_str", "N/A")
+        chg_p   = info.get("chg_pct", 0.0)
+        color   = GREEN if chg_p > 0 else (RED if chg_p < 0 else GRAY)
+        us_cells += (
+            f'<div style="padding:8px;background:white;border-radius:5px;">'
+            f'<span style="font-size:12px;color:#666;">{label}</span><br>'
+            f'<strong style="color:{color};font-size:15px;">{chg_str}</strong>'
+            f'</div>'
+        )
+
+    us_block = (
+        '<div style="background:#f0f4ff;border-radius:8px;padding:14px;margin-bottom:16px;">'
+        '<p style="margin:0 0 10px;font-weight:bold;font-size:14px;color:#1a237e;">📊 美股指數（昨夜收盤）</p>'
+        f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:8px;">{us_cells}</div>'
+        '</div>'
+    ) if us_market else '<p style="color:#aaa;font-size:13px;">美股數據未取得</p>'
+
+    # ── 新聞項目 ──────────────────────────────────────────────
+    impact_color = {"正面": GREEN, "負面": RED, "中性": GRAY}
+    news_items_html = ""
+    for item in news_analysis.get("news_items", []):
+        ic = impact_color.get(item.get("impact", "中性"), GRAY)
+        badge = (
+            f'<span style="background:{ic};color:white;padding:2px 8px;'
+            f'border-radius:10px;font-size:11px;margin-left:8px;">'
+            f'{item.get("impact","中性")}</span>'
+        )
+        news_items_html += (
+            f'<div style="margin:10px 0;padding:12px;background:#f9f9f9;'
+            f'border-left:3px solid {ic};border-radius:4px;">'
+            f'<p style="margin:0 0 4px;font-size:13px;font-weight:bold;">'
+            f'📌 {item.get("title","")}{badge}</p>'
+            f'<p style="margin:0 0 4px;font-size:13px;color:#444;">{item.get("summary","")}</p>'
+            f'<p style="margin:0;font-size:12px;color:#666;">影響標的：{item.get("affected_stocks","")}</p>'
+            f'</div>'
+        )
+    if not news_items_html:
+        news_items_html = '<p style="color:#aaa;font-size:13px;">暫無重大消息</p>'
+
+    # ── 一句話提示 ────────────────────────────────────────────
+    key_alert = news_analysis.get("key_alert", "")
+    alert_block = ""
+    if key_alert:
+        alert_block = (
+            '<div style="background:#fffde7;border-left:4px solid #f9a825;'
+            'padding:12px;border-radius:4px;margin-top:12px;">'
+            f'⚡ <strong>今日開盤前注意：</strong>{key_alert}'
+            '</div>'
+        )
+
+    return (
+        '<div class="section">'
+        '<h2 class="blue">零、🌙 昨夜美股與重大消息</h2>'
+        f'{us_block}'
+        '<p style="font-weight:bold;font-size:14px;margin:0 0 6px;">📰 重大消息與影響</p>'
+        f'{news_items_html}'
+        f'{alert_block}'
+        '</div>'
+    )
+
+
+def compose_email_html(
+    analysis: dict,
+    stocks_data: list,
+    today_str: str,
+    market_data: dict = None,
+    us_market: dict = None,
+    news_analysis: dict = None,
+) -> str:
     """組合 HTML 格式的完整 Email 內容"""
 
     if market_data is None:
         market_data = {}
+    if us_market is None:
+        us_market = {}
+    if news_analysis is None:
+        news_analysis = {}
 
     raw_by_id = {s["stock_id"]: s for s in stocks_data}
     all_stocks = analysis.get("stocks", [])
@@ -649,6 +885,9 @@ def compose_email_html(analysis: dict, stocks_data: list, today_str: str, market
     <p>報告日期：{today_str} ｜ 分析模型：Claude AI ｜ 資料來源：FinMind</p>
   </div>
 
+  <!-- 零、昨夜美股與重大消息 -->
+  {_build_us_section(us_market, news_analysis)}
+
   <!-- 一、大盤概況 -->
   <div class="section">
     <h2 class="blue">一、大盤概況</h2>
@@ -768,6 +1007,10 @@ def main():
         sys.exit(1)
 
     try:
+        # ── Step 0: 美股數據 + 新聞分析 ─────────────────────────
+        us_market     = get_us_market_data()
+        news_analysis = get_us_news_analysis(us_market)
+
         # ── Step 1: 大盤資料 ────────────────────────────────────
         market_data = get_market_data()
 
@@ -792,7 +1035,10 @@ def main():
 
         # ── Step 4: 組合並寄送 Email ────────────────────────────
         subject  = f"📊 台股 AI 每日分析報告 — {today_str}"
-        html_body = compose_email_html(analysis, stocks_data, today_str, market_data)
+        html_body = compose_email_html(
+            analysis, stocks_data, today_str, market_data,
+            us_market=us_market, news_analysis=news_analysis,
+        )
         send_email(subject, html_body)
 
         log.info("🎉 今日分析完成！")
