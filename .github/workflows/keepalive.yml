@@ -1,0 +1,30 @@
+name: ⏰ Keepalive — 保持 repo 活躍
+
+on:
+  schedule:
+    # UTC 23:00 每天 = 台灣 07:00（主 workflow 執行前 33 分鐘）
+    - cron: '0 23 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  keepalive:
+    name: 更新時間戳記，防止 GitHub 暫停排程
+    runs-on: ubuntu-latest
+    steps:
+      - name: ① 下載程式碼
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: ② 更新時間戳記並 commit
+        run: |
+          mkdir -p .github
+          echo "keepalive: $(date -u '+%Y-%m-%dT%H:%M:%SZ')" > .github/keepalive.txt
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .github/keepalive.txt
+          git commit -m "chore: keepalive $(date -u '+%Y-%m-%d')"
+          git push
