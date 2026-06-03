@@ -12,7 +12,7 @@ on:
     #   UTC 週二(2) 23:33 → 台灣 週三 07:33
     #   UTC 週三(3) 23:33 → 台灣 週四 07:33
     #   UTC 週四(4) 23:33 → 台灣 週五 07:33
-    - cron: '33 23 * * 0-4'
+    - cron: '0 22 * * 0-4'
 
   # 手動觸發（GitHub 網頁上點 Run workflow 按鈕）
   workflow_dispatch:
