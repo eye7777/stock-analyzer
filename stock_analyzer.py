@@ -285,6 +285,74 @@ def calc_kd(df: pd.DataFrame, n: int = 9) -> tuple[float, float]:
 # 資料抓取
 # ══════════════════════════════════════════════════════════════
 
+def get_futures_gate() -> dict:
+    """抓取台指期（TX）最近一筆日資料，計算夜盤收盤 vs 結算價差距，回傳閘門狀態"""
+    log.info("抓取台指期（TX）夜盤資料...")
+
+    start = (datetime.today() - timedelta(days=10)).strftime("%Y-%m-%d")
+    df = finmind_get("TaiwanFuturesDaily", "TX", start)
+
+    result = {
+        "status":      "green",
+        "emoji":       "🟢",
+        "label":       "綠燈",
+        "action":      "可依評分正常操作",
+        "night_close": None,
+        "settlement":  None,
+        "diff_pts":    None,
+        "diff_pct":    None,
+        "error":       None,
+    }
+
+    if df.empty:
+        result["error"] = "無法取得台指期資料，閘門預設綠燈"
+        log.warning("⚠️  台指期（TX）無資料，夜盤閘門預設綠燈")
+        return result
+
+    df = df.sort_values("date").reset_index(drop=True)
+
+    if "close" not in df.columns or "settlement_price" not in df.columns:
+        result["error"] = f"台指期資料缺少欄位（現有：{list(df.columns)}），閘門預設綠燈"
+        log.warning(f"⚠️  {result['error']}")
+        return result
+
+    for col in ["close", "settlement_price"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    last = df.iloc[-1]
+    night_close = last.get("close")
+    settlement  = last.get("settlement_price")
+
+    if pd.isna(night_close) or pd.isna(settlement) or settlement == 0:
+        result["error"] = "台指期收盤價或結算價無效，閘門預設綠燈"
+        log.warning(f"⚠️  {result['error']}")
+        return result
+
+    night_close = float(night_close)
+    settlement  = float(settlement)
+    diff_pts    = round(night_close - settlement, 0)
+    diff_pct    = round((night_close - settlement) / settlement * 100, 2)
+
+    result["night_close"] = night_close
+    result["settlement"]  = settlement
+    result["diff_pts"]    = diff_pts
+    result["diff_pct"]    = diff_pct
+
+    if diff_pts <= -200:
+        result.update({"status": "red",    "emoji": "🔴", "label": "紅燈", "action": "今日暫停所有新進場"})
+    elif diff_pts <= -100:
+        result.update({"status": "yellow", "emoji": "🟡", "label": "黃燈", "action": "降低倉位"})
+    else:
+        result.update({"status": "green",  "emoji": "🟢", "label": "綠燈", "action": "可依評分正常操作"})
+
+    sign = "+" if diff_pts >= 0 else ""
+    log.info(
+        f"  ✅ 台指期夜盤收盤：{night_close:.0f}  結算價：{settlement:.0f}"
+        f"  差距：{sign}{diff_pts:.0f}點（{sign}{diff_pct:.2f}%）→ {result['emoji']} {result['label']}"
+    )
+    return result
+
+
 def get_market_data() -> dict:
     """抓取台灣加權指數（大盤）資料
     FinMind 正確 data_id 為 'TAIEX'（非 Y9999）
@@ -655,6 +723,40 @@ def analyze_with_claude(stocks_data: list, market_data: dict) -> dict:
 # Email 組合與寄送
 # ══════════════════════════════════════════════════════════════
 
+def _build_gate_banner(gate: dict) -> str:
+    """組裝台指期夜盤閘門大型橫幅（顯示於報告最頂端）"""
+    status = gate.get("status", "green")
+    bg_map = {"red": "#c0392b", "yellow": "#d68910", "green": "#1e8449"}
+    bg     = bg_map.get(status, "#1e8449")
+
+    if gate.get("error"):
+        detail = f'<span style="font-size:13px;opacity:0.8;">（{gate["error"]}）</span>'
+    else:
+        nc   = gate.get("night_close", 0)
+        st   = gate.get("settlement",  0)
+        pts  = gate.get("diff_pts",    0)
+        pct  = gate.get("diff_pct",    0)
+        sign = "+" if pts >= 0 else ""
+        detail = (
+            f'<span style="font-size:14px;opacity:0.9;">'
+            f'台指期夜盤收盤：<strong>{nc:,.0f}</strong> ｜ '
+            f'結算價：<strong>{st:,.0f}</strong> ｜ '
+            f'差距：<strong>{sign}{pts:.0f}點（{sign}{pct:.2f}%）</strong>'
+            f'</span>'
+        )
+
+    return f"""
+  <!-- 台指期夜盤閘門 -->
+  <div style="background:{bg};padding:22px 30px;text-align:center;">
+    <div style="font-size:52px;line-height:1.1;">{gate.get("emoji","🟢")}</div>
+    <div style="font-size:26px;font-weight:bold;color:white;margin:6px 0;">
+      台指期夜盤閘門：{gate.get("label","綠燈")} — {gate.get("action","")}
+    </div>
+    <div style="margin-top:6px;color:rgba(255,255,255,0.85);">{detail}</div>
+  </div>
+"""
+
+
 def _build_us_section(us_market: dict, news_analysis: dict) -> str:
     """組裝「零、昨夜美股與重大消息」HTML 區塊"""
     GREEN = "#27ae60"
@@ -734,6 +836,7 @@ def compose_email_html(
     market_data: dict = None,
     us_market: dict = None,
     news_analysis: dict = None,
+    futures_gate: dict = None,
 ) -> str:
     """組合 HTML 格式的完整 Email 內容"""
 
@@ -743,6 +846,8 @@ def compose_email_html(
         us_market = {}
     if news_analysis is None:
         news_analysis = {}
+    if futures_gate is None:
+        futures_gate = {"status": "green", "emoji": "🟢", "label": "綠燈", "action": "可依評分正常操作", "error": "未取得資料"}
 
     raw_by_id = {s["stock_id"]: s for s in stocks_data}
     all_stocks = analysis.get("stocks", [])
@@ -889,6 +994,9 @@ def compose_email_html(
     <p>報告日期：{today_str} ｜ 分析模型：Claude AI ｜ 資料來源：FinMind</p>
   </div>
 
+  <!-- 台指期夜盤閘門 -->
+  {_build_gate_banner(futures_gate)}
+
   <!-- 零、昨夜美股與重大消息 -->
   {_build_us_section(us_market, news_analysis)}
 
@@ -1011,14 +1119,17 @@ def main():
         sys.exit(1)
 
     try:
-        # ── Step 0: 美股數據 + 新聞分析 ─────────────────────────
+        # ── Step 0: 台指期夜盤閘門 ──────────────────────────────
+        futures_gate = get_futures_gate()
+
+        # ── Step 1: 美股數據 + 新聞分析 ─────────────────────────
         us_market     = get_us_market_data()
         news_analysis = get_us_news_analysis(us_market)
 
-        # ── Step 1: 大盤資料 ────────────────────────────────────
+        # ── Step 2: 大盤資料 ────────────────────────────────────
         market_data = get_market_data()
 
-        # ── Step 2: 逐一抓取股票資料 ────────────────────────────
+        # ── Step 3: 逐一抓取股票資料 ────────────────────────────
         log.info(f"開始抓取 {len(STOCKS)} 檔股票資料...")
         stocks_data = []
         for stock_id in STOCKS:
@@ -1034,14 +1145,16 @@ def main():
                     "error": str(e),
                 })
 
-        # ── Step 3: Claude AI 分析 ───────────────────────────────
+        # ── Step 4: Claude AI 分析 ───────────────────────────────
         analysis = analyze_with_claude(stocks_data, market_data)
 
-        # ── Step 4: 組合並寄送 Email ────────────────────────────
-        subject  = f"📊 台股 AI 每日分析報告 — {today_str}"
+        # ── Step 5: 組合並寄送 Email ────────────────────────────
+        gate_emoji = futures_gate.get("emoji", "📊")
+        subject    = f"{gate_emoji} 台股 AI 每日分析報告 — {today_str}"
         html_body = compose_email_html(
             analysis, stocks_data, today_str, market_data,
             us_market=us_market, news_analysis=news_analysis,
+            futures_gate=futures_gate,
         )
         send_email(subject, html_body)
 
