@@ -10,6 +10,7 @@ import sys
 import json
 import time
 import logging
+import subprocess
 import traceback
 import smtplib
 from datetime import datetime, timedelta
@@ -25,7 +26,19 @@ try:
     import yfinance as yf
     HAS_YFINANCE = True
 except ImportError:
-    HAS_YFINANCE = False
+    # yfinance 未安裝時自動安裝，避免排程執行時因環境缺套件而跳過美股數據
+    print("⚠️  偵測到 yfinance 未安裝，嘗試自動安裝...")
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--quiet", "yfinance>=0.2.40"],
+            check=True,
+        )
+        import yfinance as yf
+        HAS_YFINANCE = True
+        print("✅ yfinance 自動安裝完成")
+    except Exception as _install_err:
+        print(f"⚠️  yfinance 自動安裝失敗，跳過美股數據：{_install_err}")
+        HAS_YFINANCE = False
 
 # ══════════════════════════════════════════════════════════════
 # 載入環境變數
@@ -287,7 +300,15 @@ def calc_kd(df: pd.DataFrame, n: int = 9) -> tuple[float, float]:
 # ══════════════════════════════════════════════════════════════
 
 def get_futures_gate() -> dict:
-    """抓取台指期（TX）最近一筆日資料，計算夜盤收盤 vs 結算價差距，回傳閘門狀態"""
+    """抓取台指期（TX）近月合約，比較夜盤收盤 vs 前一交易日結算價，回傳閘門狀態
+
+    FinMind 的 TaiwanFuturesDaily 每個交易日會回傳多筆資料：
+    - 多個到期月合約（近月、遠月）以及跨月價差合約（contract_date 含 "/"）
+    - 每個合約再拆成 trading_session = "position"（日盤）與 "after_market"（夜盤）
+    - settlement_price（結算價）只有日盤（position）那筆會有值，夜盤固定是 0
+    因此必須先篩選出「近月合約」，分別取最新一筆夜盤收盤，以及在夜盤日期
+    之前最近一個交易日的日盤結算價，兩者相減才是正確的夜盤閘門判斷。
+    """
     log.info("抓取台指期（TX）夜盤資料...")
 
     start = (datetime.today() - timedelta(days=10)).strftime("%Y-%m-%d")
@@ -310,27 +331,45 @@ def get_futures_gate() -> dict:
         log.warning("⚠️  台指期（TX）無資料，夜盤閘門預設綠燈")
         return result
 
-    df = df.sort_values("date").reset_index(drop=True)
-
-    if "close" not in df.columns or "settlement_price" not in df.columns:
+    required_cols = {"date", "contract_date", "close", "settlement_price", "trading_session"}
+    if not required_cols.issubset(df.columns):
         result["error"] = f"台指期資料缺少欄位（現有：{list(df.columns)}），閘門預設綠燈"
         log.warning(f"⚠️  {result['error']}")
         return result
 
+    df = df.copy()
+    df["contract_date"] = df["contract_date"].astype(str)
+    # 排除跨月價差合約，只保留單一到期月的合約
+    df = df[~df["contract_date"].str.contains("/")]
     for col in ["close", "settlement_price"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    last = df.iloc[-1]
-    night_close = last.get("close")
-    settlement  = last.get("settlement_price")
+    df_after    = df[(df["trading_session"] == "after_market") & (df["close"] > 0)]
+    df_position = df[(df["trading_session"] == "position") & (df["settlement_price"] > 0)]
 
-    if pd.isna(night_close) or pd.isna(settlement) or settlement == 0:
+    if df_after.empty or df_position.empty:
         result["error"] = "台指期收盤價或結算價無效，閘門預設綠燈"
         log.warning(f"⚠️  {result['error']}")
         return result
 
-    night_close = float(night_close)
-    settlement  = float(settlement)
+    # 夜盤：取近月合約（contract_date 最小）最新一筆有效收盤
+    after_date = df_after["date"].max()
+    after_row  = df_after[df_after["date"] == after_date].sort_values("contract_date").iloc[0]
+    night_close = float(after_row["close"])
+
+    # 結算價：取夜盤日期「之前」最近一個交易日的日盤結算（找不到就退而求其次取最新一筆）
+    df_position_prior = df_position[df_position["date"] < after_date]
+    if df_position_prior.empty:
+        df_position_prior = df_position
+    settlement_date = df_position_prior["date"].max()
+    position_row = df_position_prior[df_position_prior["date"] == settlement_date].sort_values("contract_date").iloc[0]
+    settlement = float(position_row["settlement_price"])
+
+    if not night_close or not settlement:
+        result["error"] = "台指期收盤價或結算價無效，閘門預設綠燈"
+        log.warning(f"⚠️  {result['error']}")
+        return result
+
     diff_pts    = round(night_close - settlement, 0)
     diff_pct    = round((night_close - settlement) / settlement * 100, 2)
 
