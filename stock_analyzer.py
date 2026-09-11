@@ -295,6 +295,129 @@ def calc_kd(df: pd.DataFrame, n: int = 9) -> tuple[float, float]:
     return round(k_val, 2), round(d_val, 2)
 
 
+def calc_atr(df: pd.DataFrame, n: int = 14) -> "float | None":
+    """計算 ATR(n)（Average True Range，平均真實區間）
+
+    df 必須包含 max（最高）、min（最低）、close（收盤）欄位，且已依日期排序。
+    True Range = max(當日高低差, |當日高 − 前收|, |當日低 − 前收|)
+    ATR = 最近 n 日 True Range 的簡單移動平均。
+
+    資料筆數不足（< n + 1，因為需要前一日收盤）時回傳 None，
+    由呼叫端 fallback 回固定比例停損停利。
+    """
+    need = {"max", "min", "close"}
+    if not need.issubset(df.columns) or len(df) < n + 1:
+        return None
+
+    high  = pd.to_numeric(df["max"],   errors="coerce")
+    low   = pd.to_numeric(df["min"],   errors="coerce")
+    close = pd.to_numeric(df["close"], errors="coerce")
+    prev_close = close.shift(1)
+
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low  - prev_close).abs(),
+    ], axis=1).max(axis=1)
+
+    atr = tr.rolling(n).mean().iloc[-1]
+    if pd.isna(atr) or atr <= 0:
+        return None
+    return float(round(atr, 2))
+
+
+# ══════════════════════════════════════════════════════════════
+# 評分與交易價位（Python 端計算，取代 LLM 算術）
+# ══════════════════════════════════════════════════════════════
+
+def score_stock(s: dict) -> dict:
+    """依固定規則在 Python 端直接計算評分，避免 LLM 算術誤差（滿分 10 分）
+
+    規則與原本寫在 Claude prompt 內的完全一致：
+      基本面（max 2）：avg_yoy≥30%→2，15–30%→1，其他→0
+      籌碼面（max 4）：外資買超 +1，外資連買≥3日再 +1，投信買超 +1，投信連買≥3日再 +1
+      技術面（max 4）：站上MA5 +1，站上MA20 +1，KD黃金交叉且K<80再 +1，
+                      量比>1.2且當日收紅再 +1
+      total_score = 三項加總；recommend = total_score ≥ 7
+    """
+    # ── 基本面（max 2）──
+    avg_yoy = s.get("avg_yoy")
+    if avg_yoy is None:
+        fundamental = 0
+    elif avg_yoy >= 30:
+        fundamental = 2
+    elif avg_yoy >= 15:
+        fundamental = 1
+    else:
+        fundamental = 0
+
+    # ── 籌碼面（max 4）──
+    chip = 0
+    if s.get("foreign_net", 0) > 0:
+        chip += 1
+        if s.get("foreign_consec", 0) >= 3:
+            chip += 1
+    if s.get("trust_net", 0) > 0:
+        chip += 1
+        if s.get("trust_consec", 0) >= 3:
+            chip += 1
+
+    # ── 技術面（max 4）──
+    technical = 0
+    if s.get("above_ma5"):
+        technical += 1
+    if s.get("above_ma20"):
+        technical += 1
+    if s.get("kd_cross") and s.get("K", 50.0) < 80:
+        technical += 1
+    if s.get("volume_ratio", 1.0) > 1.2 and (s.get("price_chg_pct") or 0) > 0:
+        technical += 1
+
+    total = fundamental + chip + technical
+    return {
+        "fundamental_score": int(fundamental),
+        "chip_score":        int(chip),
+        "technical_score":   int(technical),
+        "total_score":       int(total),
+        "recommend":         bool(total >= 7),
+    }
+
+
+def calc_trade_levels(close, atr) -> dict:
+    """依 ATR 計算停損／停利價位（取一位小數）
+
+      停損   = close − 1.5 × ATR
+      target1 = close + 2 × ATR（先出一半）
+      target2 = close + 3 × ATR（全出）
+
+    ATR 為 None 或非正值（資料不足）時 fallback 回原本固定比例：
+      停損 close×0.95、target1 close×1.08、target2 close×1.12
+    """
+    if close is None or close <= 0:
+        return {
+            "stop_loss": "N/A", "target1": "N/A", "target2": "N/A",
+            "level_basis": "無收盤價",
+        }
+
+    if atr and atr > 0:
+        stop = close - 1.5 * atr
+        t1   = close + 2.0 * atr
+        t2   = close + 3.0 * atr
+        basis = f"ATR={atr:.2f}（停損 −1.5×、目標 +2×/+3×）"
+    else:
+        stop = close * 0.95
+        t1   = close * 1.08
+        t2   = close * 1.12
+        basis = "固定比例 −5%/+8%/+12%（ATR 資料不足）"
+
+    return {
+        "stop_loss":   f"{stop:.1f}",
+        "target1":     f"{t1:.1f}",
+        "target2":     f"{t2:.1f}",
+        "level_basis": basis,
+    }
+
+
 # ══════════════════════════════════════════════════════════════
 # 資料抓取
 # ══════════════════════════════════════════════════════════════
@@ -456,6 +579,7 @@ def get_stock_data(stock_id: str) -> dict:
         "K": 50.0,
         "D": 50.0,
         "kd_cross": False,
+        "atr": None,
         "foreign_net": 0,
         "trust_net": 0,
         "foreign_consec": 0,
@@ -514,6 +638,9 @@ def get_stock_data(stock_id: str) -> dict:
         result["K"]        = float(k)
         result["D"]        = float(d)
         result["kd_cross"] = bool(k > d)
+
+    # ATR(14)：供 ATR 動態停損停利使用；資料不足時為 None，由下游 fallback 回固定比例
+    result["atr"] = calc_atr(df_price)
 
     # ── 2. 三大法人（外資 + 投信）─────────────────────────────────
     time.sleep(0.3)  # 避免 API rate limit
@@ -593,7 +720,7 @@ def get_stock_data(stock_id: str) -> dict:
     log.info(
         f"    [{name}] 收盤={result['close']} 漲跌={result['price_chg_pct']}%"
         f" MA5={result['ma5']} MA20={result['ma20']}"
-        f" K={result['K']} D={result['D']}"
+        f" K={result['K']} D={result['D']} ATR={result['atr']}"
         f" 外資={result['foreign_net']:+d}張(連{result['foreign_consec']}日)"
         f" 投信={result['trust_net']:+d}張(連{result['trust_consec']}日)"
         f" 營收YoY: {rev_str}"
@@ -609,15 +736,17 @@ def get_stock_data(stock_id: str) -> dict:
 
 def analyze_with_claude(stocks_data: list, market_data: dict) -> dict:
     """
-    將所有股票資料送給 Claude API（使用 Tool Use 強制輸出合法 JSON）
-    取得評分、建議、進出場價位等結構化分析
+    評分與交易價位在 Python 端直接計算（score_stock / calc_trade_levels），
+    Claude API 只負責產生文字說明（各面向理由、進場區間、風險提示等），
+    最後由本函式把系統計算的數值覆蓋回 Claude 的輸出，確保分數與價位精確。
     """
-    log.info("呼叫 Claude API 進行 AI 分析...")
+    log.info("計算評分（Python）＋呼叫 Claude API 產生文字說明...")
 
     client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
 
     # 準備給 Claude 的資料摘要（全部轉為 Python 原生型別）
     stocks_summary = []
+    scored_by_id = {}   # stock_id -> {評分欄位..., stop_loss, target1, target2, level_basis}
     for s in stocks_data:
         if s.get("error"):
             stocks_summary.append({
@@ -645,6 +774,7 @@ def analyze_with_claude(stocks_data: list, market_data: dict) -> dict:
             "K":                   float(s["K"]),
             "D":                   float(s["D"]),
             "kd_cross":            bool(s["kd_cross"]),
+            "atr":                 float(s["atr"]) if s.get("atr") is not None else None,
             "foreign_net_lots":    int(s["foreign_net"]),
             "trust_net_lots":      int(s["trust_net"]),
             "foreign_consec_days": int(s["foreign_consec"]),
@@ -653,24 +783,43 @@ def analyze_with_claude(stocks_data: list, market_data: dict) -> dict:
             "avg_yoy_pct":         float(s["avg_yoy"]) if s["avg_yoy"] is not None else None,
         })
 
-    prompt = f"""你是台股量化分析師，請用繁體中文分析以下股票並呼叫 output_analysis 工具。
+        # ── Python 端直接計算評分與 ATR 停損停利（取代 LLM 算術）──
+        sid = str(s["stock_id"])
+        levels = calc_trade_levels(
+            float(s["close"]) if s.get("close") is not None else None,
+            s.get("atr"),
+        )
+        scored_by_id[sid] = {**score_stock(s), **levels}
+
+    # 傳給 Claude 的評分結果（只含數字，供其撰寫理由時對照）
+    scores_for_prompt = {
+        sid: {k: v[k] for k in (
+            "fundamental_score", "chip_score", "technical_score",
+            "total_score", "recommend",
+        )}
+        for sid, v in scored_by_id.items()
+    }
+
+    prompt = f"""你是台股量化分析師，請用繁體中文為以下股票撰寫分析說明，並呼叫 output_analysis 工具。
 
 大盤：加權指數 {market_data.get('close','N/A')} 點，漲跌 {market_data.get('change','N/A')}（{market_data.get('change_pct','N/A')}）
 
 股票資料（JSON）：
 {json.dumps(stocks_summary, ensure_ascii=False, indent=2)}
 
-【評分規則，嚴格依數據執行，滿分10分】
+【評分結果 —— 已由系統依固定規則計算完成，數字不可更改，請依這些分數撰寫理由】
+{json.dumps(scores_for_prompt, ensure_ascii=False, indent=2)}
+
+評分規則（僅供你撰寫理由時對照，實際分數以上方系統計算為準，滿分10分）：
 基本面（max 2）：avg_yoy_pct≥30%→2分，15-30%→1分，其他→0分
 籌碼面（max 4）：外資買超+1，外資連買≥3日再+1，投信買超+1，投信連買≥3日再+1
 技術面（max 4）：above_ma5=true+1，above_ma20=true+1，kd_cross=true且K<80再+1，volume_ratio>1.2且price_chg_pct>0再+1
 
 【輸出要求】
-- total_score = 三項分數加總（必須精確）
-- recommend：total_score≥7才填true
-- 進出場：stop_loss=close×0.95，target1=close×1.08，target2=close×1.12（均取一位小數）
-- 各reason欄位限50字以內
-- summary限30字以內
+- 逐檔輸出 fundamental_reason / chip_reason / technical_reason，內容需與系統給的分數一致，各限50字以內
+- entry_range：建議進場區間（參考昨收價，例如「95.0–97.5」）
+- summary限30字以內；watch_conditions：未達推薦門檻（總分<7）時要觀察的改善條件
+- 停損停利價位由系統以 ATR 計算，你不需輸出
 - market_summary/risk_warning/overall_foreign_trend各限60字以內"""
 
     # ── 使用 Tool Use 確保輸出合法 JSON（最可靠方式）────────────────
@@ -689,30 +838,17 @@ def analyze_with_claude(stocks_data: list, market_data: dict) -> dict:
                             "properties": {
                                 "stock_id":           {"type": "string"},
                                 "name":               {"type": "string"},
-                                "total_score":        {"type": "integer", "minimum": 0, "maximum": 10},
-                                "fundamental_score":  {"type": "integer", "minimum": 0, "maximum": 2},
-                                "fundamental_reason": {"type": "string"},
-                                "chip_score":         {"type": "integer", "minimum": 0, "maximum": 4},
-                                "chip_reason":        {"type": "string"},
-                                "technical_score":    {"type": "integer", "minimum": 0, "maximum": 4},
-                                "technical_reason":   {"type": "string"},
-                                "recommend":          {"type": "boolean"},
-                                "close":              {"type": "number"},
-                                "entry_range":        {"type": "string"},
-                                "stop_loss":          {"type": "string"},
-                                "target1":            {"type": "string"},
-                                "target2":            {"type": "string"},
-                                "summary":            {"type": "string"},
-                                "watch_conditions":   {"type": "string"},
+                                "fundamental_reason": {"type": "string", "description": "基本面說明（50字內），須與系統分數一致"},
+                                "chip_reason":        {"type": "string", "description": "籌碼面說明（50字內），須與系統分數一致"},
+                                "technical_reason":   {"type": "string", "description": "技術面說明（50字內），須與系統分數一致"},
+                                "entry_range":        {"type": "string", "description": "建議進場區間，參考昨收價"},
+                                "summary":            {"type": "string", "description": "一句話總結（30字內）"},
+                                "watch_conditions":   {"type": "string", "description": "未達推薦門檻時的改善觀察條件"},
                             },
                             "required": [
-                                "stock_id", "name", "total_score",
-                                "fundamental_score", "fundamental_reason",
-                                "chip_score", "chip_reason",
-                                "technical_score", "technical_reason",
-                                "recommend", "close",
-                                "entry_range", "stop_loss", "target1", "target2",
-                                "summary", "watch_conditions",
+                                "stock_id", "name",
+                                "fundamental_reason", "chip_reason", "technical_reason",
+                                "entry_range", "summary", "watch_conditions",
                             ],
                         },
                     },
@@ -738,25 +874,60 @@ def analyze_with_claude(stocks_data: list, market_data: dict) -> dict:
         log.warning("⚠️  Claude 回傳被 max_tokens 截斷，部分資料可能不完整")
 
     # 從 tool_use block 中取出結構化結果
+    result = None
     for block in message.content:
         if block.type == "tool_use" and block.name == "output_analysis":
             result = block.input
-            # ── 強制用 STOCKS 字典覆蓋公司名稱 ──────────────────────
-            # Claude 有時會產生錯誤名稱（如「田勝明」→「晟銘電」），
-            # 以 stock_id 為 key 強制寫入正確名稱，AI 無法覆蓋
-            for s in result.get("stocks", []):
-                sid = s.get("stock_id", "")
-                if sid in STOCKS:
-                    s["name"] = STOCKS[sid]   # ← 永遠用這裡的正確名稱
-            log.info(f"  Claude 回傳 {len(result.get('stocks', []))} 檔評分結果")
-            for s in result.get("stocks", []):
-                log.info(f"    {s.get('name','?')}({s.get('stock_id','?')}): "
-                         f"總={s.get('total_score','?')} 基={s.get('fundamental_score','?')} "
-                         f"籌={s.get('chip_score','?')} 技={s.get('technical_score','?')} "
-                         f"推薦={s.get('recommend','?')}")
-            return result
+            break
+    if result is None:
+        raise ValueError("Claude 未回傳 output_analysis 工具呼叫結果")
 
-    raise ValueError("Claude 未回傳 output_analysis 工具呼叫結果")
+    # ── 以 stock_id 對回 Claude 產生的文字說明 ──────────────────
+    narr_by_id = {str(s.get("stock_id", "")): s for s in result.get("stocks", [])}
+
+    # ── 重建 stocks：數值一律用 Python 計算結果，文字用 Claude 輸出 ──
+    # 分數、推薦、收盤價、ATR 停損停利皆由系統填入，AI 無法覆蓋；
+    # 公司名稱一律以 STOCKS 字典為準（Claude 有時會產生錯誤名稱）。
+    final_stocks = []
+    for s in stocks_data:
+        if s.get("error"):
+            continue
+        sid  = str(s["stock_id"])
+        sc   = scored_by_id.get(sid, {})
+        narr = narr_by_id.get(sid, {})
+        final_stocks.append({
+            "stock_id":           sid,
+            "name":               STOCKS.get(sid, s.get("name", "")),
+            "fundamental_score":  sc.get("fundamental_score", 0),
+            "fundamental_reason": narr.get("fundamental_reason", ""),
+            "chip_score":         sc.get("chip_score", 0),
+            "chip_reason":        narr.get("chip_reason", ""),
+            "technical_score":    sc.get("technical_score", 0),
+            "technical_reason":   narr.get("technical_reason", ""),
+            "total_score":        sc.get("total_score", 0),
+            "recommend":          sc.get("recommend", False),
+            "close":              float(s["close"]) if s.get("close") is not None else None,
+            "entry_range":        narr.get("entry_range", "N/A"),
+            "stop_loss":          sc.get("stop_loss", "N/A"),
+            "target1":            sc.get("target1", "N/A"),
+            "target2":            sc.get("target2", "N/A"),
+            "summary":            narr.get("summary", ""),
+            "watch_conditions":   narr.get("watch_conditions", ""),
+            "level_basis":        sc.get("level_basis", ""),
+        })
+
+    result["stocks"] = final_stocks
+
+    log.info(f"  評分完成（Python 計算）：{len(final_stocks)} 檔")
+    for s in final_stocks:
+        log.info(
+            f"    {s['name']}({s['stock_id']}): "
+            f"總={s['total_score']} 基={s['fundamental_score']} "
+            f"籌={s['chip_score']} 技={s['technical_score']} "
+            f"推薦={s['recommend']} 停損={s['stop_loss']} 目標={s['target1']}/{s['target2']} "
+            f"[{s['level_basis']}]"
+        )
+    return result
 
 
 # ══════════════════════════════════════════════════════════════
@@ -911,7 +1082,6 @@ def compose_email_html(
 
     def stock_card(s, border_color, show_trade=True):
         raw  = raw_by_id.get(s["stock_id"], {})
-        vol  = raw.get("volume", 0)
         vrat = raw.get("volume_ratio", 1.0)
         chg  = raw.get("price_chg_pct", 0)
         chg_color = GREEN if (chg or 0) >= 0 else RED
@@ -955,14 +1125,32 @@ def compose_email_html(
         """
 
         if show_trade and s.get("recommend"):
+            def _pct(level_str):
+                """由實際價位與昨收算出漲跌幅字串（ATR 停損停利的幅度非固定）"""
+                try:
+                    lv = float(level_str)
+                    c  = float(s.get("close") or 0)
+                    if c > 0:
+                        p = (lv - c) / c * 100
+                        return f"{'+' if p >= 0 else ''}{p:.1f}%"
+                except (TypeError, ValueError):
+                    pass
+                return "N/A"
+
+            basis = s.get("level_basis", "")
+            basis_html = (
+                f'<br><span style="font-size:11px;color:#888;">依據：{basis}</span>'
+                if basis else ""
+            )
             card += f"""
           <div style="background:#e8f5e9;padding:10px 14px;border-radius:4px;
                       margin-top:10px;font-size:13px;">
             💰 <strong>交易策略</strong>：
             進場區間 <strong>{s.get('entry_range','N/A')}</strong> ｜
-            停損 <strong style="color:{RED}">{s.get('stop_loss','N/A')}</strong>（-5%）<br>
-            🎯 第一目標：<strong style="color:{GREEN}">{s.get('target1','N/A')}</strong>（+8% 出一半）｜
-               第二目標：<strong style="color:{GREEN}">{s.get('target2','N/A')}</strong>（+12% 全出）
+            停損 <strong style="color:{RED}">{s.get('stop_loss','N/A')}</strong>（{_pct(s.get('stop_loss'))}）<br>
+            🎯 第一目標：<strong style="color:{GREEN}">{s.get('target1','N/A')}</strong>（{_pct(s.get('target1'))} 出一半）｜
+               第二目標：<strong style="color:{GREEN}">{s.get('target2','N/A')}</strong>（{_pct(s.get('target2'))} 全出）
+            {basis_html}
           </div>
             """
 
