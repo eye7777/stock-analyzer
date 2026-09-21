@@ -5,6 +5,9 @@ on:
   # 由 cron-job.org 外部觸發
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 # ── 工作定義 ──────────────────────────────────────────────────
 jobs:
   run-stock-analysis:
@@ -14,6 +17,8 @@ jobs:
     steps:
       - name: ① 下載程式碼
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: ② 設定 Python 3.11
         uses: actions/setup-python@v5
@@ -35,6 +40,27 @@ jobs:
           RECIPIENT_EMAIL:   ${{ secrets.RECIPIENT_EMAIL }}
         run: python stock_analyzer.py
 
-      - name: ⑤ 顯示執行日誌（失敗時）
+      # 寫回 data/signals_log.csv，放在④之後：這裡失敗完全不影響④已經
+      # 寄出的信。只在 main 分支跑（手動選別的分支測試不會誤寫回 main），
+      # continue-on-error 確保這步失敗不會讓整個 job 變紅、掩蓋④其實成功。
+      - name: ⑤ 寫回訊號日誌（僅 main 分支）
+        if: github.ref == 'refs/heads/main'
+        continue-on-error: true
+        run: |
+          git add data/signals_log.csv
+          if git diff --cached --quiet; then
+            echo "signals_log.csv 無變更，略過 commit"
+          else
+            git config user.name  "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git commit -m "chore: update signals_log [skip ci]"
+            if git pull --rebase origin main; then
+              git push origin HEAD:main
+            else
+              echo "git pull --rebase 失敗（可能有衝突），略過本次 push，下次執行再試"
+            fi
+          fi
+
+      - name: ⑥ 顯示執行日誌（失敗時）
         if: failure()
         run: tail -50 analyzer.log 2>/dev/null || echo "無日誌檔案"
