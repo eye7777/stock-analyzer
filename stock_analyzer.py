@@ -1525,7 +1525,7 @@ def read_signals_log(path: str = SIGNALS_LOG_PATH) -> pd.DataFrame:
         for col in SIGNALS_LOG_COLUMNS:
             if col not in df.columns:
                 df[col] = None
-        df = df[SIGNALS_LOG_COLUMNS]
+        df = df[SIGNALS_LOG_COLUMNS].copy()  # 避免後面賦值觸發 SettingWithCopyWarning
         for col in SIGNALS_LOG_BACKFILL_COLUMNS:
             df[col] = df[col].astype(object)
         return df
@@ -1785,7 +1785,14 @@ def write_signals_log(
     else:
         log.warning("  ⚠️  signals_log：本次沒有任何可寫入的列")
 
-    df_log = backfill_outcomes(df_log, price_cache)
+    # 回填失敗不可以連累當天新寫入的訊號：df_log 這時已經併入本次的
+    # new_rows，回填只是錦上添花，出錯就跳過，照樣把新訊號寫出去。
+    try:
+        df_log = backfill_outcomes(df_log, price_cache)
+    except Exception as e:
+        log.error(f"⚠️  backfill_outcomes 失敗：{e}\n{traceback.format_exc()}")
+        print("::warning::signals_log 回填失敗，本次只寫入新訊號")
+
     df_log = df_log.sort_values(["data_date", "stock_id"]).reset_index(drop=True)
 
     os.makedirs(SIGNALS_LOG_DIR, exist_ok=True)
