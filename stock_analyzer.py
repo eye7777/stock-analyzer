@@ -975,6 +975,9 @@ def analyze_with_claude(stocks_data: list, market_data: dict) -> dict:
     # 準備給 Claude 的資料摘要（全部轉為 Python 原生型別）
     stocks_summary = []
     scored_by_id = {}   # stock_id -> {評分欄位..., stop_loss, target1, target2, level_basis}
+    flagged_sids = set()  # data_warning 非空的股票代號：不送進 Claude prompt，
+                           # 避免 market_summary／overall_foreign_trend／risk_warning
+                           # 這幾個跨股票彙總欄位引用到可能失真的分數或指標
     for s in stocks_data:
         if s.get("error"):
             stocks_summary.append({
@@ -984,48 +987,56 @@ def analyze_with_claude(stocks_data: list, market_data: dict) -> dict:
             })
             continue
 
+        sid = str(s["stock_id"])
+        if s.get("data_warning"):
+            flagged_sids.add(sid)
+
         rev_str = "、".join([
             f"{x['month']} YoY={x['yoy']}%" if x["yoy"] is not None else f"{x['month']} YoY=N/A"
             for x in s.get("revenue_yoy_list", [])
         ]) or "無資料"
 
-        stocks_summary.append({
-            "stock_id":            str(s["stock_id"]),
-            "name":                str(s["name"]),
-            "close":               float(s["close"]) if s["close"] is not None else None,
-            "price_chg_pct":       float(s["price_chg_pct"]) if s["price_chg_pct"] is not None else 0.0,
-            "volume_ratio":        float(s["volume_ratio"]) if s["volume_ratio"] is not None else 1.0,
-            "ma5":                 float(s["ma5"]) if s["ma5"] is not None else None,
-            "ma20":                float(s["ma20"]) if s["ma20"] is not None else None,
-            "above_ma5":           bool(s["above_ma5"]),
-            "above_ma20":          bool(s["above_ma20"]),
-            "K":                   float(s["K"]),
-            "D":                   float(s["D"]),
-            "kd_cross":            bool(s["kd_cross"]),
-            "atr":                 float(s["atr"]) if s.get("atr") is not None else None,
-            "foreign_net_lots":    int(s["foreign_net"]),
-            "trust_net_lots":      int(s["trust_net"]),
-            "foreign_consec_days": int(s["foreign_consec"]),
-            "trust_consec_days":   int(s["trust_consec"]),
-            "revenue_3m":          str(rev_str),
-            "avg_yoy_pct":         float(s["avg_yoy"]) if s["avg_yoy"] is not None else None,
-        })
+        if not s.get("data_warning"):
+            stocks_summary.append({
+                "stock_id":            sid,
+                "name":                str(s["name"]),
+                "close":               float(s["close"]) if s["close"] is not None else None,
+                "price_chg_pct":       float(s["price_chg_pct"]) if s["price_chg_pct"] is not None else 0.0,
+                "volume_ratio":        float(s["volume_ratio"]) if s["volume_ratio"] is not None else 1.0,
+                "ma5":                 float(s["ma5"]) if s["ma5"] is not None else None,
+                "ma20":                float(s["ma20"]) if s["ma20"] is not None else None,
+                "above_ma5":           bool(s["above_ma5"]),
+                "above_ma20":          bool(s["above_ma20"]),
+                "K":                   float(s["K"]),
+                "D":                   float(s["D"]),
+                "kd_cross":            bool(s["kd_cross"]),
+                "atr":                 float(s["atr"]) if s.get("atr") is not None else None,
+                "foreign_net_lots":    int(s["foreign_net"]),
+                "trust_net_lots":      int(s["trust_net"]),
+                "foreign_consec_days": int(s["foreign_consec"]),
+                "trust_consec_days":   int(s["trust_consec"]),
+                "revenue_3m":          str(rev_str),
+                "avg_yoy_pct":         float(s["avg_yoy"]) if s["avg_yoy"] is not None else None,
+            })
 
-        # ── Python 端直接計算評分與 ATR 停損停利（取代 LLM 算術）──
-        sid = str(s["stock_id"])
+        # ── Python 端直接計算評分與 ATR 停損停利（取代 LLM 算術）── 對每一檔都要
+        # 執行，不受 data_warning 影響：final_stocks／stock_card 仍需要這些數字，
+        # 只是報告端（compose_email_html）依 data_warning 決定顯不顯示，不是這裡。
         levels = calc_trade_levels(
             float(s["close"]) if s.get("close") is not None else None,
             s.get("atr"),
         )
         scored_by_id[sid] = {**score_stock(s), **levels}
 
-    # 傳給 Claude 的評分結果（只含數字，供其撰寫理由時對照）
+    # 傳給 Claude 的評分結果（只含數字，供其撰寫理由時對照）——排除 data_warning
+    # 股票，理由同上：避免彙總文字引用到可能失真的分數。
     scores_for_prompt = {
         sid: {k: v[k] for k in (
             "fundamental_score", "chip_score", "technical_score",
             "total_score", "recommend",
         )}
         for sid, v in scored_by_id.items()
+        if sid not in flagged_sids
     }
 
     prompt = f"""你是台股量化分析師，請用繁體中文為以下股票撰寫分析說明，並呼叫 output_analysis 工具。
