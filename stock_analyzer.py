@@ -73,6 +73,24 @@ STOCKS = {
 }
 
 # ══════════════════════════════════════════════════════════════
+# 事件旗標設定
+# ══════════════════════════════════════════════════════════════
+# 手動維護的個股風險備註（司法調查、處置股等），有設定的股票會在報告中以
+# 醒目文字顯示。
+#
+# 處置股為何在此手動維護：TWSE OpenAPI 有免費、可程式取得的處置股清單
+# （https://openapi.twse.com.tw/v1/announcement/punish，集中市場公布處置股票，
+# 免 token），但 FinMind 對應的 TaiwanStockDispositionSecuritiesPeriod
+# 資料集目前 token 等級（register）打不到（回傳 400 需升級付費層），
+# 尚未串接自動偵測，故先以此手動 config 頂著。
+EVENT_FLAGS = {
+    "3037": "司法調查中",
+}
+
+# 除權息事件距今幾個「交易日」內視為「近期」，報告會標示提醒旗標
+RECENT_DIVIDEND_WINDOW_DAYS = 20
+
+# ══════════════════════════════════════════════════════════════
 # 日誌設定
 # ══════════════════════════════════════════════════════════════
 LOG_FILE = os.path.join(_DIR, "analyzer.log")
@@ -324,6 +342,88 @@ def calc_atr(df: pd.DataFrame, n: int = 14) -> "float | None":
     if pd.isna(atr) or atr <= 0:
         return None
     return float(round(atr, 2))
+
+
+# ══════════════════════════════════════════════════════════════
+# 除權息還原（避免 MA/KD/ATR 被未還原股價的價格斷層扭曲）
+# ══════════════════════════════════════════════════════════════
+
+def get_dividend_events(stock_id: str, start_date: str) -> pd.DataFrame:
+    """取得除權息事件（含現金股利、股票股利、現金增資稀釋等）
+
+    FinMind TaiwanStockDividendResult 的 date 欄位即為實際除權息交易日，
+    before_price/after_price 是當天真正生效的還原前後基準價，可直接拿來
+    反推還原因子（after_price / before_price）。
+    """
+    df = finmind_get("TaiwanStockDividendResult", stock_id, start_date)
+    if df.empty:
+        return df
+
+    df = df.copy()
+    df["date"] = df["date"].astype(str)
+    for col in ["before_price", "after_price"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["before_price", "after_price"])
+    df = df[df["before_price"] > 0]
+
+    return df.sort_values("date").reset_index(drop=True)
+
+
+def apply_price_adjustment(df_price: pd.DataFrame, div_events: pd.DataFrame) -> pd.DataFrame:
+    """用除權息事件的 before/after 基準價，把股價還原成連續序列（向前還原法）
+
+    以「最新一筆價格為基準」：對每一筆除權息事件，事件日「之前」的所有歷史
+    價格都乘上 after_price / before_price 的比例；事件日當天與之後的價格
+    維持原始成交價不變。因此今日（最新）收盤價、進場區間、停損價永遠等於
+    實際盤面報價，不會與券商報價脫鉤——只有歷史區間被壓縮，藉此消除除權息
+    造成的價格斷層，讓 MA/KD/ATR 能在連續價格上計算。
+    """
+    df = df_price.copy()
+    if div_events is None or div_events.empty:
+        return df
+
+    factor = pd.Series(1.0, index=df.index)
+    for _, ev in div_events.iterrows():
+        ratio = ev["after_price"] / ev["before_price"]
+        if pd.isna(ratio) or ratio <= 0:
+            continue
+        factor.loc[df["date"] < ev["date"]] *= ratio
+
+    for col in ["close", "max", "min", "open"]:
+        if col in df.columns:
+            df[col] = df[col] * factor
+
+    return df
+
+
+def get_recent_dividend_flag(
+    df_price: pd.DataFrame, div_events: pd.DataFrame, n: int = RECENT_DIVIDEND_WINDOW_DAYS
+) -> "dict | None":
+    """判斷最近一筆除權息事件是否落在近 n 個交易日內，供報告顯示提醒旗標"""
+    if div_events is None or div_events.empty or df_price.empty:
+        return None
+
+    dates = df_price["date"].reset_index(drop=True)
+    latest_event = div_events.iloc[-1]
+    ev_date = latest_event["date"]
+
+    matches = dates[dates == ev_date]
+    if matches.empty:
+        return None
+
+    trading_days_ago = (len(dates) - 1) - matches.index[-1]
+    if trading_days_ago < 0 or trading_days_ago > n:
+        return None
+
+    ratio = float(latest_event["after_price"]) / float(latest_event["before_price"])
+    return {
+        "date": ev_date,
+        "type": str(latest_event.get("stock_or_cache_dividend", "") or "除權息"),
+        "before_price": float(latest_event["before_price"]),
+        "after_price": float(latest_event["after_price"]),
+        "chg_pct": float(round((ratio - 1) * 100, 2)),
+        "trading_days_ago": int(trading_days_ago),
+    }
 
 
 # ══════════════════════════════════════════════════════════════
@@ -586,6 +686,7 @@ def get_stock_data(stock_id: str) -> dict:
         "trust_consec": 0,
         "revenue_yoy_list": [],
         "avg_yoy": None,
+        "dividend_flag": None,
         "error": None,
     }
 
@@ -596,13 +697,24 @@ def get_stock_data(stock_id: str) -> dict:
         return result
 
     df_price = df_price.sort_values("date").reset_index(drop=True)
-    for col in ["close", "max", "min", "Trading_Volume"]:
+    for col in ["close", "max", "min", "open", "Trading_Volume"]:
         if col in df_price.columns:
             df_price[col] = pd.to_numeric(df_price[col], errors="coerce")
 
     if len(df_price) < 2:
         result["error"] = "股價資料筆數不足"
         return result
+
+    # ── 除權息還原 ────────────────────────────────────────────────
+    # TaiwanStockPrice 是未還原股價，除權息（含現金增資稀釋）當天會出現價格
+    # 斷層，直接拿來算 MA/KD/ATR 會嚴重失真（例：6669 緯穎 2026/09/02 現金
+    # 增資，未還原股價單日「跌」66.5%，MA20/ATR 因此完全脫離現價）。用
+    # TaiwanStockDividendResult 的 before/after 基準價反推還原因子，對事件
+    # 日之前的歷史價格做「向前還原」——今日收盤價維持原始報價不變。
+    time.sleep(0.3)  # 避免 API rate limit
+    div_events = get_dividend_events(stock_id, start_90)
+    result["dividend_flag"] = get_recent_dividend_flag(df_price, div_events)
+    df_price = apply_price_adjustment(df_price, div_events)
 
     last_row = df_price.iloc[-1]
     prev_row = df_price.iloc[-2]
@@ -726,6 +838,15 @@ def get_stock_data(stock_id: str) -> dict:
         f" 營收YoY: {rev_str}"
         f" 均YoY={result['avg_yoy']}"
     )
+    if result["dividend_flag"]:
+        df_ = result["dividend_flag"]
+        log.info(
+            f"    [{name}] ⚡ 近期除權息：{df_['date']}（{df_['trading_days_ago']} 個交易日前）"
+            f" {df_['type']} {df_['before_price']}→{df_['after_price']}"
+            f"（{df_['chg_pct']:+.2f}%），MA/KD/ATR 已依還原股價計算"
+        )
+    if stock_id in EVENT_FLAGS:
+        log.warning(f"    [{name}] ⚠️  個股警示：{EVENT_FLAGS[stock_id]}")
 
     return result
 
@@ -914,6 +1035,8 @@ def analyze_with_claude(stocks_data: list, market_data: dict) -> dict:
             "summary":            narr.get("summary", ""),
             "watch_conditions":   narr.get("watch_conditions", ""),
             "level_basis":        sc.get("level_basis", ""),
+            "dividend_flag":      s.get("dividend_flag"),
+            "event_note":         EVENT_FLAGS.get(sid),
         })
 
     result["stocks"] = final_stocks
@@ -1080,6 +1203,32 @@ def compose_email_html(
             f'{score}/{max_score}</span>'
         )
 
+    def flag_banner_html(s):
+        """個股警示（EVENT_FLAGS 手動備註）與近期除權息旗標"""
+        html = ""
+        event_note = s.get("event_note")
+        if event_note:
+            html += (
+                f'<div style="background:#fdecea;border-left:4px solid {RED};'
+                f'padding:6px 10px;border-radius:4px;margin-bottom:8px;'
+                f'font-size:12px;color:#c0392b;font-weight:bold;">'
+                f'⚠️ 個股警示：{event_note}'
+                f'</div>'
+            )
+        div_flag = s.get("dividend_flag")
+        if div_flag:
+            html += (
+                f'<div style="background:#eef2ff;border-left:4px solid #5c6bc0;'
+                f'padding:6px 10px;border-radius:4px;margin-bottom:8px;'
+                f'font-size:12px;color:#3949ab;">'
+                f'🔔 近期除權息（{div_flag.get("type","")}）：{div_flag.get("date","")}'
+                f'（{div_flag.get("trading_days_ago",0)} 個交易日前）　'
+                f'還原前 {div_flag.get("before_price","")} → 還原後 {div_flag.get("after_price","")}'
+                f'（{div_flag.get("chg_pct",0):+.2f}%）｜指標已依還原股價計算'
+                f'</div>'
+            )
+        return html
+
     def stock_card(s, border_color, show_trade=True):
         raw  = raw_by_id.get(s["stock_id"], {})
         vrat = raw.get("volume_ratio", 1.0)
@@ -1104,6 +1253,8 @@ def compose_email_html(
                 總分 {s.get('total_score',0)}/10</span>
             </div>
           </div>
+
+          {flag_banner_html(s)}
 
           <table style="width:100%;font-size:13px;color:#555;margin-bottom:8px;">
             <tr>
@@ -1171,8 +1322,16 @@ def compose_email_html(
     watch_section = "".join(stock_card(s, YELLOW, show_trade=False) for s in watchlist) or (
         "<p style='color:#aaa;'>無觀望標的</p>"
     )
+    def _weak_flags_html(s):
+        parts = []
+        if s.get("event_note"):
+            parts.append(f"<span style='color:{RED};'>⚠️ {s['event_note']}</span>")
+        if s.get("dividend_flag"):
+            parts.append("<span style='color:#3949ab;'>🔔 近期除權息</span>")
+        return f"<br>{'　'.join(parts)}" if parts else ""
+
     weak_rows = "".join(
-        f"<tr><td style='padding:6px;'>{s['name']}（{s['stock_id']}）</td>"
+        f"<tr><td style='padding:6px;'>{s['name']}（{s['stock_id']}）{_weak_flags_html(s)}</td>"
         f"<td style='padding:6px;text-align:center;'>{s.get('total_score',0)}/10</td>"
         f"<td style='padding:6px;color:#888;'>{s.get('summary','')}</td></tr>"
         for s in weak
