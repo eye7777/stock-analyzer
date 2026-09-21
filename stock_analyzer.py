@@ -378,9 +378,10 @@ def get_dividend_events(stock_id: str, start_date: str) -> "tuple[pd.DataFrame, 
     回傳 (events_df, error_msg)：
     - error_msg 為 None 代表 API 呼叫成功，即使 events_df 是空的（這檔股票
       在查詢區間內單純沒有除權息）也算成功，不是失敗。
-    - error_msg 非 None 代表 API 呼叫本身失敗（HTTP 例外或 FinMind
-      status != 200），此時 events_df 必為空。呼叫端不可把這種情況誤判成
-      「沒有除權息」而靜默略過還原——必須另外標示 data_warning。
+    - error_msg 非 None 代表重試 2 次（間隔 1 秒，共 3 次嘗試）後 API 呼叫
+      仍然失敗（HTTP 例外或 FinMind status != 200），此時 events_df 必為
+      空。呼叫端不可把這種情況誤判成「沒有除權息」而靜默略過還原——必須
+      另外標示 data_warning。
 
     FinMind TaiwanStockDividendResult 的 date 欄位即為實際除權息交易日，
     before_price/after_price 是當天真正生效的除權息前後基準價，可直接拿來
@@ -389,9 +390,21 @@ def get_dividend_events(stock_id: str, start_date: str) -> "tuple[pd.DataFrame, 
     增資）除權——不是現金增資（現金增資另有 CashIncreaseSubscriptionRate
     等欄位，在 TaiwanStockDividend 資料集裡，且與此欄位無關）。
     """
-    df, err = _finmind_request("TaiwanStockDividendResult", stock_id, start_date)
+    df, err = pd.DataFrame(), None
+    max_attempts = 3  # 1 次原始嘗試 + 2 次重試
+    for attempt in range(1, max_attempts + 1):
+        df, err = _finmind_request("TaiwanStockDividendResult", stock_id, start_date)
+        if err is None:
+            break
+        if attempt < max_attempts:
+            log.warning(
+                f"FinMind TaiwanStockDividendResult ({stock_id}) "
+                f"第 {attempt} 次失敗：{err}，1 秒後重試"
+            )
+            time.sleep(1)
+
     if err:
-        log.warning(f"FinMind TaiwanStockDividendResult ({stock_id}): {err}")
+        log.warning(f"FinMind TaiwanStockDividendResult ({stock_id})：重試 {max_attempts - 1} 次後仍失敗：{err}")
         return df, err
 
     if df.empty:
@@ -472,8 +485,12 @@ def detect_price_gaps(
     """在還原後的收盤價序列上，掃描近 lookback 個交易日內是否仍有單日變動
     超過 threshold_pct% 的斷層
 
-    只做標示（data_warning），完全不影響 score_stock / calc_trade_levels
-    的計算結果——分數與停損停利照舊輸出，報告會另外提示「不可信」讓人判斷。
+    只做標示（data_warning），不改變 score_stock / calc_trade_levels 的計算
+    邏輯——分數與停損停利仍照常算出、寫入 result。但報告端（
+    compose_email_html）看到 data_warning 後，會把該股票整檔從推薦進場／
+    觀望／暫不關注清單中排除，且不顯示分數與進場區間、停損停利，只留昨收、
+    漲跌幅與警示文字讓人工判斷——不是「算出來但加註不可信」，而是報告畫面
+    直接不顯示這些可能失真的數字。
     """
     if df_price.empty or len(df_price) < 2:
         return []
@@ -1441,7 +1458,13 @@ def compose_email_html(
         return f"<br>{'　'.join(parts)}" if parts else ""
 
     def _flagged_card(s):
-        """data_warning 股票只顯示警示文字，不顯示分數、進場區間、停損停利"""
+        """data_warning 股票：顯示原始昨收／漲跌供人工判斷，仍隱藏分數、
+        進場區間、停損停利（這些數字用的是同一份可能失真的資料算出來的）"""
+        raw  = raw_by_id.get(s["stock_id"], {})
+        close = raw.get("close", s.get("close"))
+        chg   = raw.get("price_chg_pct", 0) or 0
+        chg_color = GREEN if chg >= 0 else RED
+        chg_str   = f"+{chg}%" if chg >= 0 else f"{chg}%"
         msgs = "；".join(w.get("message", "") for w in (s.get("data_warning") or []))
         return f"""
         <div style="background:#fff3e0;border-left:5px solid #e67e22;
@@ -1449,18 +1472,32 @@ def compose_email_html(
           <h3 style="margin:0 0 6px;font-size:16px;color:#a04000;">
             {s['name']}（{s['stock_id']}）
           </h3>
+          <p style="margin:0 0 6px;font-size:13px;color:#555;">
+            📈 昨收（原始報價）：<strong>{close if close is not None else 'N/A'}</strong>
+            &nbsp;漲跌：<strong style="color:{chg_color}">{chg_str}</strong>
+            &nbsp;<span style="color:#a04000;font-weight:bold;">請手動判斷</span>
+          </p>
           <p style="margin:0;font-size:13px;color:#a04000;font-weight:bold;">
             🚧 {msgs}
           </p>
           <p style="margin:6px 0 0;font-size:12px;color:#888;">
-            資料可能失真，本檔本次不計分、不列入任何清單，僅顯示警示。
+            分數、進場區間、停損停利已隱藏，不列入任何清單。
           </p>
         </div>
         """
 
-    flagged_section = "".join(_flagged_card(s) for s in flagged) or (
-        "<p style='color:#aaa;'>無</p>"
-    )
+    flagged_section = "".join(_flagged_card(s) for s in flagged)
+    flagged_block = ""
+    if flagged:
+        flagged_block = f"""
+  <!-- 資料異常警示（data_warning，不計分不列入任何清單） -->
+  <div class="section">
+    <h2 style="font-size:16px;margin:0 0 14px;color:#e67e22;border-left:4px solid #e67e22;padding-left:10px;">
+      🚧 資料異常警示（共 {len(flagged)} 檔，不計分、不列入任何清單）
+    </h2>
+    {flagged_section}
+  </div>
+"""
 
     weak_rows = "".join(
         f"<tr><td style='padding:6px;'>{s['name']}（{s['stock_id']}）{_weak_flags_html(s)}</td>"
@@ -1530,13 +1567,7 @@ def compose_email_html(
     <p style="font-size:14px;color:#555;">{analysis.get('market_summary','')}</p>
   </div>
 
-  <!-- 資料異常警示（data_warning，不計分不列入任何清單） -->
-  <div class="section">
-    <h2 style="font-size:16px;margin:0 0 14px;color:#e67e22;border-left:4px solid #e67e22;padding-left:10px;">
-      🚧 資料異常警示（共 {len(flagged)} 檔，不計分、不列入任何清單）
-    </h2>
-    {flagged_section}
-  </div>
+  {flagged_block}
 
   <!-- 二、推薦進場清單 -->
   <div class="section">
