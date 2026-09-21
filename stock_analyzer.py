@@ -84,8 +84,7 @@ STOCKS = {
 # 資料集目前 token 等級（register）打不到（回傳 400 需升級付費層），
 # 尚未串接自動偵測，故先以此手動 config 頂著。
 EVENT_FLAGS = {
-    # TODO: 「起」後面的日期是佔位，請填入司法調查實際的起始日期後再上線
-    "3037": "司法調查中（日期待確認，起）",
+    "3037": "司法調查中（8/28 起）",
 }
 
 # 除權息事件距今幾個「交易日」內視為「近期」，報告會標示提醒旗標
@@ -1278,9 +1277,15 @@ def compose_email_html(
     raw_by_id = {s["stock_id"]: s for s in stocks_data}
     all_stocks = analysis.get("stocks", [])
 
-    recommended = [s for s in all_stocks if s.get("total_score", 0) >= 7]
-    watchlist   = [s for s in all_stocks if 5 <= s.get("total_score", 0) <= 6]
-    weak        = [s for s in all_stocks if s.get("total_score", 0) < 5]
+    # 有 data_warning（價格資料疑似失真）的股票，不參與進場清單／觀望／暫不
+    # 關注的分類，也不顯示分數與進場區間、停損停利——這些數字很可能是用失真
+    # 資料算出來的，混在正常清單裡反而誤導。獨立另闢一區只顯示警示文字。
+    flagged     = [s for s in all_stocks if s.get("data_warning")]
+    clean       = [s for s in all_stocks if not s.get("data_warning")]
+
+    recommended = [s for s in clean if s.get("total_score", 0) >= 7]
+    watchlist   = [s for s in clean if 5 <= s.get("total_score", 0) <= 6]
+    weak        = [s for s in clean if s.get("total_score", 0) < 5]
 
     # ── 色彩常數 ──
     GREEN  = "#27ae60"
@@ -1427,14 +1432,35 @@ def compose_email_html(
         "<p style='color:#aaa;'>無觀望標的</p>"
     )
     def _weak_flags_html(s):
+        # weak 只包含 clean（無 data_warning）的股票，data_warning 走 flagged_section
         parts = []
-        if s.get("data_warning"):
-            parts.append("<span style='color:#e67e22;'>🚧 資料品質警示</span>")
         if s.get("event_note"):
             parts.append(f"<span style='color:{RED};'>⚠️ {s['event_note']}</span>")
         if s.get("dividend_flag"):
             parts.append("<span style='color:#3949ab;'>🔔 近期除權息</span>")
         return f"<br>{'　'.join(parts)}" if parts else ""
+
+    def _flagged_card(s):
+        """data_warning 股票只顯示警示文字，不顯示分數、進場區間、停損停利"""
+        msgs = "；".join(w.get("message", "") for w in (s.get("data_warning") or []))
+        return f"""
+        <div style="background:#fff3e0;border-left:5px solid #e67e22;
+                    padding:16px;margin:12px 0;border-radius:6px;">
+          <h3 style="margin:0 0 6px;font-size:16px;color:#a04000;">
+            {s['name']}（{s['stock_id']}）
+          </h3>
+          <p style="margin:0;font-size:13px;color:#a04000;font-weight:bold;">
+            🚧 {msgs}
+          </p>
+          <p style="margin:6px 0 0;font-size:12px;color:#888;">
+            資料可能失真，本檔本次不計分、不列入任何清單，僅顯示警示。
+          </p>
+        </div>
+        """
+
+    flagged_section = "".join(_flagged_card(s) for s in flagged) or (
+        "<p style='color:#aaa;'>無</p>"
+    )
 
     weak_rows = "".join(
         f"<tr><td style='padding:6px;'>{s['name']}（{s['stock_id']}）{_weak_flags_html(s)}</td>"
@@ -1502,6 +1528,14 @@ def compose_email_html(
       （<strong>{market_data.get('change_pct','N/A')}</strong>）
     </p>
     <p style="font-size:14px;color:#555;">{analysis.get('market_summary','')}</p>
+  </div>
+
+  <!-- 資料異常警示（data_warning，不計分不列入任何清單） -->
+  <div class="section">
+    <h2 style="font-size:16px;margin:0 0 14px;color:#e67e22;border-left:4px solid #e67e22;padding-left:10px;">
+      🚧 資料異常警示（共 {len(flagged)} 檔，不計分、不列入任何清單）
+    </h2>
+    {flagged_section}
   </div>
 
   <!-- 二、推薦進場清單 -->
