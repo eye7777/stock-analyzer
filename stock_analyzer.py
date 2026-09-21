@@ -1317,21 +1317,13 @@ def compose_email_html(
             f'{score}/{max_score}</span>'
         )
 
-    def flag_banner_html(s):
-        """資料品質警示（data_warning）、個股警示（EVENT_FLAGS 手動備註）與近期除權息旗標"""
+    def _secondary_flags_html(s):
+        """個股警示（EVENT_FLAGS 手動備註）與近期除權息旗標
+
+        flag_banner_html（一般股票卡片）與 _flagged_card（data_warning
+        股票）共用同一份樣式，確保兩邊顯示一致。
+        """
         html = ""
-        for w in s.get("data_warning") or []:
-            gap_str = "、".join(
-                f"{g['date']} {g['pct']:+.1f}%" for g in (w.get("gaps") or [])
-            )
-            detail = f"（{gap_str}）" if gap_str else ""
-            html += (
-                '<div style="background:#fff3e0;border-left:4px solid #e67e22;'
-                'padding:6px 10px;border-radius:4px;margin-bottom:8px;'
-                'font-size:12px;color:#a04000;font-weight:bold;">'
-                f'🚧 資料品質警示：{w.get("message","")}{detail}'
-                '</div>'
-            )
         event_note = s.get("event_note")
         if event_note:
             html += (
@@ -1353,6 +1345,24 @@ def compose_email_html(
                 f'（{div_flag.get("chg_pct",0):+.2f}%）｜指標已依還原股價計算'
                 f'</div>'
             )
+        return html
+
+    def flag_banner_html(s):
+        """資料品質警示（data_warning）、個股警示（EVENT_FLAGS 手動備註）與近期除權息旗標"""
+        html = ""
+        for w in s.get("data_warning") or []:
+            gap_str = "、".join(
+                f"{g['date']} {g['pct']:+.1f}%" for g in (w.get("gaps") or [])
+            )
+            detail = f"（{gap_str}）" if gap_str else ""
+            html += (
+                '<div style="background:#fff3e0;border-left:4px solid #e67e22;'
+                'padding:6px 10px;border-radius:4px;margin-bottom:8px;'
+                'font-size:12px;color:#a04000;font-weight:bold;">'
+                f'🚧 資料品質警示：{w.get("message","")}{detail}'
+                '</div>'
+            )
+        html += _secondary_flags_html(s)
         return html
 
     def stock_card(s, border_color, show_trade=True):
@@ -1480,6 +1490,7 @@ def compose_email_html(
           <p style="margin:0;font-size:13px;color:#a04000;font-weight:bold;">
             🚧 {msgs}
           </p>
+          {_secondary_flags_html(s)}
           <p style="margin:6px 0 0;font-size:12px;color:#888;">
             分數、進場區間、停損停利已隱藏，不列入任何清單。
           </p>
