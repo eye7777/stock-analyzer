@@ -1343,7 +1343,18 @@ SIGNALS_LOG_COLUMNS = [
     "dividend_flag", "event_note", "data_warning_types",
     # 回填（backfill_outcomes 補）
     "entry_filled", "entry_price", "entry_day_low_hit_stop",
-    "ret_t1_pct", "ret_t5_pct", "ret_t10_pct",
+    "ret_t0_pct", "ret_t1_pct", "ret_t5_pct", "ret_t10_pct",
+    "period_high", "period_low",
+    "hit_target1", "hit_target2", "hit_stop", "ambiguous",
+    "backfill_complete",
+]
+
+# 上面「回填」那一段的欄位名稱，讀 CSV 回來後要轉成 object dtype（見
+# read_signals_log），避免布林值（entry_filled 等）之後要寫回浮點欄位
+# （ret_t1_pct 等）或空欄位時被 pandas 的型別推斷擋下來。
+SIGNALS_LOG_BACKFILL_COLUMNS = [
+    "entry_filled", "entry_price", "entry_day_low_hit_stop",
+    "ret_t0_pct", "ret_t1_pct", "ret_t5_pct", "ret_t10_pct",
     "period_high", "period_low",
     "hit_target1", "hit_target2", "hit_stop", "ambiguous",
     "backfill_complete",
@@ -1486,6 +1497,7 @@ def build_signal_row(
         "entry_filled": None,
         "entry_price": None,
         "entry_day_low_hit_stop": None,
+        "ret_t0_pct": None,
         "ret_t1_pct": None,
         "ret_t5_pct": None,
         "ret_t10_pct": None,
@@ -1500,13 +1512,23 @@ def build_signal_row(
 
 
 def read_signals_log(path: str = SIGNALS_LOG_PATH) -> pd.DataFrame:
-    """讀取現有的 signals_log.csv；檔案不存在時回傳空的、schema 正確的 DataFrame"""
+    """讀取現有的 signals_log.csv；檔案不存在時回傳空的、schema 正確的 DataFrame
+
+    回填欄位讀回來後一律轉成 object dtype：這欄位可能同時存放 True/False
+    （entry_filled 等）跟浮點數（ret_t1_pct 等）跟 NaN，如果讓 pandas 依
+    CSV 內容自行推斷成 float64（例如某欄目前全空，或全是 0/1），之後
+    backfill_outcomes 把 bool 寫進去會被 pandas 的型別檢查擋下來或悄悄
+    轉型，object dtype 才能讓每一格各自存放它該有的型別。
+    """
     if os.path.exists(path):
         df = pd.read_csv(path, dtype={"stock_id": str})
         for col in SIGNALS_LOG_COLUMNS:
             if col not in df.columns:
                 df[col] = None
-        return df[SIGNALS_LOG_COLUMNS]
+        df = df[SIGNALS_LOG_COLUMNS]
+        for col in SIGNALS_LOG_BACKFILL_COLUMNS:
+            df[col] = df[col].astype(object)
+        return df
     return pd.DataFrame(columns=SIGNALS_LOG_COLUMNS)
 
 
@@ -1543,17 +1565,19 @@ def _local_scale_factor(row, series: pd.DataFrame) -> "float | None":
 
 def _compute_outcome(row, series: pd.DataFrame) -> "dict | None":
     """對單一列訊號，用 series（該檔還原後的股價序列，date 遞增排序）漸進
-    式算出進場結果與 T+1/T+5/T+10 報酬率——不是全有全無：每個欄位只要它
-    需要的那天資料到手，這次就先寫進去，不等 T+10 全部到齊才一次寫完。
+    式算出進場結果與 T+0/T+1/T+5/T+10 報酬率——不是全有全無：每個欄位只要
+    它需要的那天資料到手，這次就先寫進去，不等 T+10 全部到齊才一次寫完。
 
     - 進場日相關欄位（entry_filled/entry_price/entry_day_low_hit_stop）與
-      ret_t1_pct／ret_t5_pct：只要這次執行的 series 涵蓋得到對應日期，
-      每次都重新計算並覆寫舊值——不是「算過一次就不再動」。這是刻意的：
-      _local_scale_factor 的縮放係數每次執行都用「當次」的 series 重算，
-      如果只在第一次寫入時算好entry_price 就鎖住，後面 T+10 用另一次執
-      行、另一個縮放係數算出來的收盤價去除，兩邊基準可能不一致（例如兩
-      次執行之間又發生一次除權息）。每次都重算，才能保證同一列所有欄位
-      永遠是同一個（當次執行的）還原基準算出來的。
+      ret_t0_pct／ret_t1_pct／ret_t5_pct：只要這次執行的 series 涵蓋得到
+      對應日期，每次都重新計算並覆寫舊值——不是「算過一次就不再動」。這
+      是刻意的：_local_scale_factor 的縮放係數每次執行都用「當次」的
+      series 重算，如果只在第一次寫入時算好 entry_price 就鎖住，後面
+      T+10 用另一次執行、另一個縮放係數算出來的收盤價去除，兩邊基準可能
+      不一致（例如兩次執行之間又發生一次除權息）。每次都重算，才能保證
+      同一列所有欄位永遠是同一個（當次執行的）還原基準算出來的。
+      entry_filled=False（no_fill）時，這三個報酬率一律明確設回 None，
+      不留上一次執行（可能是成交狀態還沒確定，或狀態改變前）殘留的舊值。
     - period_high/period_low/hit_target1/hit_target2/hit_stop/ambiguous/
       ret_t10_pct：固定要等 T+10 整個 10 天視窗都到手才一起算，同時把
       backfill_complete 設 True，之後這一列就不會再被處理、不會再被
@@ -1619,14 +1643,23 @@ def _compute_outcome(row, series: pd.DataFrame) -> "dict | None":
         i = entry_idx + offset
         return _safe_float(series.iloc[i]["close"]) if i < len(series) else None
 
-    # ── T+1／T+5 報酬：對應日期到手就（重新）算，同樣覆寫舊值 ──────
+    # ── T+0／T+1／T+5 報酬：對應日期到手就（重新）算，同樣覆寫舊值 ────
+    # 未成交（entry_filled=False）時這三個報酬率一律明確設回 None，不留
+    # 上一次執行（可能是成交狀態改變前）殘留下來的舊值。
     if entry_filled and entry_price:
+        c0 = _close_at(0)
+        if c0 is not None:
+            out["ret_t0_pct"] = round((c0 - entry_price) / entry_price * 100, 2)
         c1 = _close_at(1)
         if c1 is not None:
             out["ret_t1_pct"] = round((c1 - entry_price) / entry_price * 100, 2)
         c5 = _close_at(5)
         if c5 is not None:
             out["ret_t5_pct"] = round((c5 - entry_price) / entry_price * 100, 2)
+    else:
+        out["ret_t0_pct"] = None
+        out["ret_t1_pct"] = None
+        out["ret_t5_pct"] = None
 
     # ── T+10 整包：滿了才一次算完，同時把 backfill_complete 設 True ──
     t10_idx = entry_idx + 10
@@ -1733,13 +1766,21 @@ def write_signals_log(
 
     if new_rows:
         df_new = pd.DataFrame(new_rows, columns=SIGNALS_LOG_COLUMNS)
-        if not df_log.empty:
+        for col in SIGNALS_LOG_BACKFILL_COLUMNS:
+            df_new[col] = df_new[col].astype(object)
+
+        if df_log.empty:
+            # 空的（新檔案或剛好被濾光）DataFrame 直接 concat 在新版 pandas
+            # 會噴 FutureWarning（全 NA 欄位的型別推斷即將改變行為），這裡
+            # 沒有舊資料可合併，直接用 df_new 取代，不必真的呼叫 concat。
+            df_log = df_new
+        else:
             key_new = set(zip(df_new["data_date"].astype(str), df_new["stock_id"].astype(str)))
             mask_keep = ~df_log.apply(
                 lambda r: (str(r["data_date"]), str(r["stock_id"])) in key_new, axis=1
             )
             df_log = df_log[mask_keep]
-        df_log = pd.concat([df_log, df_new], ignore_index=True)
+            df_log = pd.concat([df_log, df_new], ignore_index=True)
         log.info(f"  📝 signals_log：本次寫入/覆寫 {len(df_new)} 列")
     else:
         log.warning("  ⚠️  signals_log：本次沒有任何可寫入的列")
