@@ -421,10 +421,10 @@ def calc_institutional_5d_aligned(df_sub: pd.DataFrame, df_price: pd.DataFrame) 
     用同一組日期分別加總 net 與成交量——避免法人序列跟股價序列各自缺漏
     的日期不同，導致「近5日」實際上指的是不同的日期範圍。
 
-    回傳 {"net_5d": ..., "pct_of_volume": ...}：
-    - net_5d：合併後可用的最近交易日（最多 5 天，可能不足 5 天）加總。
-    - pct_of_volume：只有合併後剛好湊滿 5 個共同交易日才計算；不足 5 天
-      時這個比例沒有意義，留 None（net_5d 仍照實際天數回傳，不因此留空）。
+    回傳 {"net_5d": ..., "pct_of_volume": ...}：兩者口徑一致，都要求合併
+    後剛好湊滿 5 個共同交易日才計算；不足 5 天時「近5日」本來就不成立，
+    net_5d 與 pct_of_volume 一起留 None，不會出現「net_5d 是 3 天的合計，
+    卻標成近5日」這種名不符實的情況。
     """
     if df_sub is None or df_sub.empty:
         return {"net_5d": None, "pct_of_volume": None}
@@ -435,15 +435,11 @@ def calc_institutional_5d_aligned(df_sub: pd.DataFrame, df_price: pd.DataFrame) 
         on="date", how="inner",
     ).sort_values("date")
 
-    if merged.empty:
+    if len(merged) < 5:
         return {"net_5d": None, "pct_of_volume": None}
 
     tail = merged.tail(5)
     net_5d = int(round(tail["net"].sum()))
-
-    if len(tail) < 5:
-        return {"net_5d": net_5d, "pct_of_volume": None}
-
     vol_5d = float(tail["Trading_Volume"].sum())
     return {"net_5d": net_5d, "pct_of_volume": calc_net_pct_of_volume(net_5d, vol_5d)}
 
@@ -970,8 +966,15 @@ def get_stock_data(stock_id: str) -> "tuple[dict, pd.DataFrame]":
     # ATR(14)：供 ATR 動態停損停利使用；資料不足時為 None，由下游 fallback 回固定比例
     result["atr"] = calc_atr(df_price)
 
-    # 前一日振幅% / 上影線占振幅比例（只讀 df_price，供 signals_log 用）
-    result.update(calc_prev_day_shape(df_price))
+    # 前一日振幅% / 上影線占振幅比例（只讀 df_price，供 signals_log 用）。
+    # 這個計算只是為了寫日誌，出錯不可讓報告本身的流程跟著掛掉，抓到例外
+    # 就留 None、記警告，繼續往下跑。
+    try:
+        result.update(calc_prev_day_shape(df_price))
+    except Exception as e:
+        log.warning(f"    [{name}] calc_prev_day_shape 失敗（不影響報告，供 signals_log 用）：{e}")
+        result["prev_day_amplitude_pct"] = None
+        result["prev_day_upper_shadow_pct"] = None
 
     # ── 2. 三大法人（外資 + 投信）─────────────────────────────────
     time.sleep(0.3)  # 避免 API rate limit
@@ -1000,7 +1003,15 @@ def get_stock_data(stock_id: str) -> "tuple[dict, pd.DataFrame]":
             # 後取共同的最近 5 個交易日，兩邊「5天」指同一組日期，不是各自
             # tail(5)——法人資料偶爾有缺漏日，各自 tail(5) 可能對不上同一段
             # 期間。df_sub 這次呼叫本來就抓了 90 天的每日序列，不用多打 API。
-            aligned = calc_institutional_5d_aligned(df_sub, df_price)
+            # 這也只是為了寫日誌，出錯不可影響報告本身的流程。
+            try:
+                aligned = calc_institutional_5d_aligned(df_sub, df_price)
+            except Exception as e:
+                log.warning(
+                    f"    [{name}] calc_institutional_5d_aligned（{key}）失敗"
+                    f"（不影響報告，供 signals_log 用）：{e}"
+                )
+                aligned = {"net_5d": None, "pct_of_volume": None}
             result[f"{key}_net_5d"] = aligned["net_5d"]
             result[f"{key}_net_pct_of_volume"] = aligned["pct_of_volume"]
 
@@ -1535,22 +1546,21 @@ def _compute_outcome(row, series: pd.DataFrame) -> "dict | None":
     式算出進場結果與 T+1/T+5/T+10 報酬率——不是全有全無：每個欄位只要它
     需要的那天資料到手，這次就先寫進去，不等 T+10 全部到齊才一次寫完。
 
-    - 進場日相關欄位（entry_filled/entry_price/entry_day_low_hit_stop）：
-      進場日（data_date 之後的下一個交易日）資料到手就算。進場假設：以
-      entry_high 掛限價買單，進場日最低價 ≤ entry_high 才成交，成交價 =
-      min(進場日開盤價, entry_high)；不成交則 entry_filled=False
-      （no_fill）。這組欄位一旦算過（row 裡已經有值）就不會重算。
-    - ret_t1_pct／ret_t5_pct：對應的 T+1／T+5 收盤到手就各自先算，也是
-      只算一次，不重算。未成交（entry_filled=False）時這兩個報酬率永遠
-      留 None（沒有 entry_price 可以當分母）。
+    - 進場日相關欄位（entry_filled/entry_price/entry_day_low_hit_stop）與
+      ret_t1_pct／ret_t5_pct：只要這次執行的 series 涵蓋得到對應日期，
+      每次都重新計算並覆寫舊值——不是「算過一次就不再動」。這是刻意的：
+      _local_scale_factor 的縮放係數每次執行都用「當次」的 series 重算，
+      如果只在第一次寫入時算好entry_price 就鎖住，後面 T+10 用另一次執
+      行、另一個縮放係數算出來的收盤價去除，兩邊基準可能不一致（例如兩
+      次執行之間又發生一次除權息）。每次都重算，才能保證同一列所有欄位
+      永遠是同一個（當次執行的）還原基準算出來的。
     - period_high/period_low/hit_target1/hit_target2/hit_stop/ambiguous/
-      ret_t10_pct：這組固定要等 T+10 整個 10 天視窗都到手才一起算，同時
-      把 backfill_complete 設 True——因為 period_high/low 這種「期間」統
-      計量提前算了之後還要重新擴大視窗、每次都要重算，比等到滿了再算一
-      次更複雜，沒有必要。
+      ret_t10_pct：固定要等 T+10 整個 10 天視窗都到手才一起算，同時把
+      backfill_complete 設 True，之後這一列就不會再被處理、不會再被
+      覆寫。
 
-    以上任何一組的前提資料還不到位，這次就跳過那一組，不代表整列跳過；
-    只有連進場日都還沒到（entry_idx 超出 series 範圍）才整列回傳 None。
+    只有連進場日都還沒到（entry_idx 超出 series 範圍）才整列回傳 None，
+    這次完全沒東西可寫。
 
     比較用的 entry_high/stop_loss/target1/target2 会先用 _local_scale_factor
     換算到跟 series 同一個還原基準，避免除權息造成的假觸發／假報酬。
@@ -1558,9 +1568,7 @@ def _compute_outcome(row, series: pd.DataFrame) -> "dict | None":
     ——如果 data_date 到回填當下之間有除權息事件，這幾個回填欄位就不等於
     當時的 literal 報價，而是換算後的一致基準值；CSV 裡「報價」區的原始
     欄位（close/entry_low/entry_high/stop_loss/target1/target2）完全不受
-    影響，永遠是真實報價。這個縮放係數是每次執行當下才算的，如果同一檔
-    股票在「進場欄位先寫入」與「T+10 整包寫入」這兩次不同的執行之間又發
-    生了另一次除權息，係數會不同，屬於已知的極低機率殘差誤差，不特別處理。
+    影響，永遠是真實報價。
     """
     dates = series["date"].astype(str).reset_index(drop=True)
     data_date = str(row["data_date"])
@@ -1587,41 +1595,35 @@ def _compute_outcome(row, series: pd.DataFrame) -> "dict | None":
 
     out = {}
 
-    # ── 進場日相關欄位：只算一次 ──────────────────────────────
-    if pd.isna(row.get("entry_filled")):
-        entry_row     = series.iloc[entry_idx]
-        entry_open    = _safe_float(entry_row["open"])
-        entry_day_low = _safe_float(entry_row["min"])
+    # ── 進場日相關欄位：每次都用這次執行的還原基準重新算、覆寫舊值 ──
+    entry_row     = series.iloc[entry_idx]
+    entry_open    = _safe_float(entry_row["open"])
+    entry_day_low = _safe_float(entry_row["min"])
 
-        entry_filled = False
-        entry_price  = None
-        if entry_high is not None and entry_day_low is not None and entry_open is not None:
-            if entry_day_low <= entry_high:
-                entry_filled = True
-                entry_price  = round(min(entry_open, entry_high), 2)
+    entry_filled = False
+    entry_price  = None
+    if entry_high is not None and entry_day_low is not None and entry_open is not None:
+        if entry_day_low <= entry_high:
+            entry_filled = True
+            entry_price  = round(min(entry_open, entry_high), 2)
 
-        entry_day_low_hit_stop = None
-        if stop_loss is not None and entry_day_low is not None:
-            entry_day_low_hit_stop = bool(entry_day_low <= stop_loss)
+    entry_day_low_hit_stop = None
+    if stop_loss is not None and entry_day_low is not None:
+        entry_day_low_hit_stop = bool(entry_day_low <= stop_loss)
 
-        out["entry_filled"] = entry_filled
-        out["entry_price"] = entry_price
-        out["entry_day_low_hit_stop"] = entry_day_low_hit_stop
-    else:
-        entry_filled = _is_true(row.get("entry_filled"))
-        entry_price  = _safe_float(row.get("entry_price"))
+    out["entry_filled"] = entry_filled
+    out["entry_price"] = entry_price
+    out["entry_day_low_hit_stop"] = entry_day_low_hit_stop
 
     def _close_at(offset):
         i = entry_idx + offset
         return _safe_float(series.iloc[i]["close"]) if i < len(series) else None
 
-    # ── T+1／T+5 報酬：對應日期到手各自先算，只算一次 ──────────
-    if pd.isna(row.get("ret_t1_pct")) and entry_filled and entry_price:
+    # ── T+1／T+5 報酬：對應日期到手就（重新）算，同樣覆寫舊值 ──────
+    if entry_filled and entry_price:
         c1 = _close_at(1)
         if c1 is not None:
             out["ret_t1_pct"] = round((c1 - entry_price) / entry_price * 100, 2)
-
-    if pd.isna(row.get("ret_t5_pct")) and entry_filled and entry_price:
         c5 = _close_at(5)
         if c5 is not None:
             out["ret_t5_pct"] = round((c5 - entry_price) / entry_price * 100, 2)
@@ -1663,7 +1665,7 @@ def _compute_outcome(row, series: pd.DataFrame) -> "dict | None":
         out["ambiguous"]    = ambiguous
         out["backfill_complete"] = True
 
-    return out if out else None
+    return out  # entry_idx 檢查通過後，out 一定至少有進場日相關欄位
 
 
 def backfill_outcomes(df_log: pd.DataFrame, price_cache: dict) -> pd.DataFrame:
