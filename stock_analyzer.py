@@ -84,11 +84,18 @@ STOCKS = {
 # 資料集目前 token 等級（register）打不到（回傳 400 需升級付費層），
 # 尚未串接自動偵測，故先以此手動 config 頂著。
 EVENT_FLAGS = {
-    "3037": "司法調查中",
+    # TODO: 「起」後面的日期是佔位，請填入司法調查實際的起始日期後再上線
+    "3037": "司法調查中（日期待確認，起）",
 }
 
 # 除權息事件距今幾個「交易日」內視為「近期」，報告會標示提醒旗標
 RECENT_DIVIDEND_WINDOW_DAYS = 20
+
+# 還原後的收盤價序列，近幾個交易日內若仍出現單日變動超過此百分比，視為疑似
+# 價格斷層（台股漲跌限制 ±10%，超過代表還原可能不完整，或有未被
+# TaiwanStockDividendResult 涵蓋的事件，例如股票分割）
+PRICE_GAP_LOOKBACK_DAYS = 60
+PRICE_GAP_THRESHOLD_PCT = 11.0
 
 # ══════════════════════════════════════════════════════════════
 # 日誌設定
@@ -110,8 +117,16 @@ log = logging.getLogger(__name__)
 FINMIND_BASE = "https://api.finmindtrade.com/api/v4/data"
 
 
-def finmind_get(dataset: str, stock_id: str, start_date: str) -> pd.DataFrame:
-    """呼叫 FinMind API 取得資料，失敗時回傳空 DataFrame"""
+def _finmind_request(dataset: str, stock_id: str, start_date: str) -> "tuple[pd.DataFrame, str | None]":
+    """FinMind API 的底層請求，回傳 (DataFrame, error_msg)
+
+    error_msg 為 None 代表 API 呼叫成功——即使 data 是空陣列，也視為成功的
+    「查無資料」，不是失敗。error_msg 非 None 代表呼叫本身失敗（HTTP 例外、
+    或 FinMind 回傳 status != 200），此時 DataFrame 必為空。
+    呼叫端如果需要區分「查無資料」與「API 呼叫失敗」（例如除權息這種缺資料
+    會導致還原完全沒做、卻又不會出錯的情境），必須用這個函式而不是
+    finmind_get，否則兩種情況都會被誤判成同一種空結果。
+    """
     try:
         params = {
             "dataset": dataset,
@@ -124,17 +139,27 @@ def finmind_get(dataset: str, stock_id: str, start_date: str) -> pd.DataFrame:
         data = resp.json()
 
         if data.get("status") != 200:
-            log.warning(f"FinMind {dataset} ({stock_id}): {data.get('msg', '未知錯誤')}")
-            return pd.DataFrame()
+            return pd.DataFrame(), data.get("msg", "未知錯誤")
 
         if not data.get("data"):
-            return pd.DataFrame()
+            return pd.DataFrame(), None
 
-        return pd.DataFrame(data["data"])
+        return pd.DataFrame(data["data"]), None
 
     except Exception as e:
-        log.warning(f"FinMind API 呼叫失敗 ({dataset}, {stock_id}): {e}")
-        return pd.DataFrame()
+        return pd.DataFrame(), str(e)
+
+
+def finmind_get(dataset: str, stock_id: str, start_date: str) -> pd.DataFrame:
+    """呼叫 FinMind API 取得資料，失敗時回傳空 DataFrame
+
+    沿用舊行為給大多數呼叫端使用：呼叫失敗與「查無資料」在這裡一律回傳空
+    DataFrame，差異只留在 log。需要區分兩者時改用 _finmind_request。
+    """
+    df, err = _finmind_request(dataset, stock_id, start_date)
+    if err:
+        log.warning(f"FinMind {dataset} ({stock_id}): {err}")
+    return df
 
 
 # ══════════════════════════════════════════════════════════════
@@ -348,16 +373,30 @@ def calc_atr(df: pd.DataFrame, n: int = 14) -> "float | None":
 # 除權息還原（避免 MA/KD/ATR 被未還原股價的價格斷層扭曲）
 # ══════════════════════════════════════════════════════════════
 
-def get_dividend_events(stock_id: str, start_date: str) -> pd.DataFrame:
-    """取得除權息事件（含現金股利、股票股利、現金增資稀釋等）
+def get_dividend_events(stock_id: str, start_date: str) -> "tuple[pd.DataFrame, str | None]":
+    """取得除權息事件（現金股利／股票股利，含盈餘或公積轉增資）
+
+    回傳 (events_df, error_msg)：
+    - error_msg 為 None 代表 API 呼叫成功，即使 events_df 是空的（這檔股票
+      在查詢區間內單純沒有除權息）也算成功，不是失敗。
+    - error_msg 非 None 代表 API 呼叫本身失敗（HTTP 例外或 FinMind
+      status != 200），此時 events_df 必為空。呼叫端不可把這種情況誤判成
+      「沒有除權息」而靜默略過還原——必須另外標示 data_warning。
 
     FinMind TaiwanStockDividendResult 的 date 欄位即為實際除權息交易日，
-    before_price/after_price 是當天真正生效的還原前後基準價，可直接拿來
-    反推還原因子（after_price / before_price）。
+    before_price/after_price 是當天真正生效的除權息前後基準價，可直接拿來
+    反推還原因子（after_price / before_price）。stock_or_cache_dividend
+    欄位標示事件類型："息"＝現金股利除息，"權"＝股票股利（含盈餘/公積轉
+    增資）除權——不是現金增資（現金增資另有 CashIncreaseSubscriptionRate
+    等欄位，在 TaiwanStockDividend 資料集裡，且與此欄位無關）。
     """
-    df = finmind_get("TaiwanStockDividendResult", stock_id, start_date)
+    df, err = _finmind_request("TaiwanStockDividendResult", stock_id, start_date)
+    if err:
+        log.warning(f"FinMind TaiwanStockDividendResult ({stock_id}): {err}")
+        return df, err
+
     if df.empty:
-        return df
+        return df, None
 
     df = df.copy()
     df["date"] = df["date"].astype(str)
@@ -366,7 +405,7 @@ def get_dividend_events(stock_id: str, start_date: str) -> pd.DataFrame:
     df = df.dropna(subset=["before_price", "after_price"])
     df = df[df["before_price"] > 0]
 
-    return df.sort_values("date").reset_index(drop=True)
+    return df.sort_values("date").reset_index(drop=True), None
 
 
 def apply_price_adjustment(df_price: pd.DataFrame, div_events: pd.DataFrame) -> pd.DataFrame:
@@ -424,6 +463,35 @@ def get_recent_dividend_flag(
         "chg_pct": float(round((ratio - 1) * 100, 2)),
         "trading_days_ago": int(trading_days_ago),
     }
+
+
+def detect_price_gaps(
+    df_price: pd.DataFrame,
+    lookback: int = PRICE_GAP_LOOKBACK_DAYS,
+    threshold_pct: float = PRICE_GAP_THRESHOLD_PCT,
+) -> list:
+    """在還原後的收盤價序列上，掃描近 lookback 個交易日內是否仍有單日變動
+    超過 threshold_pct% 的斷層
+
+    只做標示（data_warning），完全不影響 score_stock / calc_trade_levels
+    的計算結果——分數與停損停利照舊輸出，報告會另外提示「不可信」讓人判斷。
+    """
+    if df_price.empty or len(df_price) < 2:
+        return []
+
+    tail = df_price.tail(lookback + 1).reset_index(drop=True)
+    closes = pd.to_numeric(tail["close"], errors="coerce")
+    pct_chg = closes.pct_change() * 100
+
+    gaps = []
+    for i in range(1, len(tail)):
+        p = pct_chg.iloc[i]
+        if pd.notna(p) and abs(p) > threshold_pct:
+            gaps.append({
+                "date": str(tail["date"].iloc[i]),
+                "pct": float(round(p, 2)),
+            })
+    return gaps
 
 
 # ══════════════════════════════════════════════════════════════
@@ -687,6 +755,7 @@ def get_stock_data(stock_id: str) -> dict:
         "revenue_yoy_list": [],
         "avg_yoy": None,
         "dividend_flag": None,
+        "data_warning": [],
         "error": None,
     }
 
@@ -706,15 +775,32 @@ def get_stock_data(stock_id: str) -> dict:
         return result
 
     # ── 除權息還原 ────────────────────────────────────────────────
-    # TaiwanStockPrice 是未還原股價，除權息（含現金增資稀釋）當天會出現價格
-    # 斷層，直接拿來算 MA/KD/ATR 會嚴重失真（例：6669 緯穎 2026/09/02 現金
-    # 增資，未還原股價單日「跌」66.5%，MA20/ATR 因此完全脫離現價）。用
+    # TaiwanStockPrice 是未還原股價，除權息當天會出現價格斷層，直接拿來算
+    # MA/KD/ATR 會嚴重失真（例：6669 緯穎 2026/09/02 股票股利（盈餘/公積
+    # 轉增資）除權，FinMind stock_or_cache_dividend="權"，未還原股價單日
+    # 「跌」66.5%，MA20/ATR 因此完全脫離現價；不是現金增資）。用
     # TaiwanStockDividendResult 的 before/after 基準價反推還原因子，對事件
     # 日之前的歷史價格做「向前還原」——今日收盤價維持原始報價不變。
     time.sleep(0.3)  # 避免 API rate limit
-    div_events = get_dividend_events(stock_id, start_90)
+    div_events, div_err = get_dividend_events(stock_id, start_90)
+    if div_err:
+        result["data_warning"].append({
+            "type": "dividend_fetch_failed",
+            "message": "除權息資料取得失敗，指標可能未還原",
+            "detail": div_err,
+        })
     result["dividend_flag"] = get_recent_dividend_flag(df_price, div_events)
     df_price = apply_price_adjustment(df_price, div_events)
+
+    # 還原完成後再檢查一次：近 60 個交易日內若仍有單日變動超過 11%，代表還原
+    # 可能不完整（或有其他未涵蓋的事件），只標示不改分數。
+    gaps = detect_price_gaps(df_price)
+    if gaps:
+        result["data_warning"].append({
+            "type": "price_gap",
+            "message": "疑似價格斷層，技術面分數與停損停利不可信",
+            "gaps": gaps,
+        })
 
     last_row = df_price.iloc[-1]
     prev_row = df_price.iloc[-2]
@@ -847,6 +933,11 @@ def get_stock_data(stock_id: str) -> dict:
         )
     if stock_id in EVENT_FLAGS:
         log.warning(f"    [{name}] ⚠️  個股警示：{EVENT_FLAGS[stock_id]}")
+    for w in result["data_warning"]:
+        gap_str = ""
+        if w.get("gaps"):
+            gap_str = "；" + "、".join(f"{g['date']} {g['pct']:+.1f}%" for g in w["gaps"])
+        log.warning(f"    [{name}] 🚧 資料品質警示：{w['message']}{gap_str}")
 
     return result
 
@@ -1037,6 +1128,7 @@ def analyze_with_claude(stocks_data: list, market_data: dict) -> dict:
             "level_basis":        sc.get("level_basis", ""),
             "dividend_flag":      s.get("dividend_flag"),
             "event_note":         EVENT_FLAGS.get(sid),
+            "data_warning":       s.get("data_warning") or [],
         })
 
     result["stocks"] = final_stocks
@@ -1204,8 +1296,20 @@ def compose_email_html(
         )
 
     def flag_banner_html(s):
-        """個股警示（EVENT_FLAGS 手動備註）與近期除權息旗標"""
+        """資料品質警示（data_warning）、個股警示（EVENT_FLAGS 手動備註）與近期除權息旗標"""
         html = ""
+        for w in s.get("data_warning") or []:
+            gap_str = "、".join(
+                f"{g['date']} {g['pct']:+.1f}%" for g in (w.get("gaps") or [])
+            )
+            detail = f"（{gap_str}）" if gap_str else ""
+            html += (
+                '<div style="background:#fff3e0;border-left:4px solid #e67e22;'
+                'padding:6px 10px;border-radius:4px;margin-bottom:8px;'
+                'font-size:12px;color:#a04000;font-weight:bold;">'
+                f'🚧 資料品質警示：{w.get("message","")}{detail}'
+                '</div>'
+            )
         event_note = s.get("event_note")
         if event_note:
             html += (
@@ -1223,7 +1327,7 @@ def compose_email_html(
                 f'font-size:12px;color:#3949ab;">'
                 f'🔔 近期除權息（{div_flag.get("type","")}）：{div_flag.get("date","")}'
                 f'（{div_flag.get("trading_days_ago",0)} 個交易日前）　'
-                f'還原前 {div_flag.get("before_price","")} → 還原後 {div_flag.get("after_price","")}'
+                f'除權息前收盤 {div_flag.get("before_price","")} → 參考價 {div_flag.get("after_price","")}'
                 f'（{div_flag.get("chg_pct",0):+.2f}%）｜指標已依還原股價計算'
                 f'</div>'
             )
@@ -1324,6 +1428,8 @@ def compose_email_html(
     )
     def _weak_flags_html(s):
         parts = []
+        if s.get("data_warning"):
+            parts.append("<span style='color:#e67e22;'>🚧 資料品質警示</span>")
         if s.get("event_note"):
             parts.append(f"<span style='color:{RED};'>⚠️ {s['event_note']}</span>")
         if s.get("dividend_flag"):
