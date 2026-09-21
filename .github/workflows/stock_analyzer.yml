@@ -43,21 +43,38 @@ jobs:
       # 寫回 data/signals_log.csv，放在④之後：這裡失敗完全不影響④已經
       # 寄出的信。只在 main 分支跑（手動選別的分支測試不會誤寫回 main），
       # continue-on-error 確保這步失敗不會讓整個 job 變紅、掩蓋④其實成功。
+      # push 失敗最多重試 3 次，每次重試前都先 git pull --rebase；rebase
+      # 失敗就 git rebase --abort 後算這次嘗試失敗，換下一次重試。
       - name: ⑤ 寫回訊號日誌（僅 main 分支）
         if: github.ref == 'refs/heads/main'
         continue-on-error: true
         run: |
           git add data/signals_log.csv
           if git diff --cached --quiet; then
-            echo "signals_log.csv 無變更，略過 commit"
+            echo "::warning::signals_log.csv 無變更，略過 commit"
           else
             git config user.name  "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
             git commit -m "chore: update signals_log [skip ci]"
-            if git pull --rebase origin main; then
-              git push origin HEAD:main
-            else
-              echo "git pull --rebase 失敗（可能有衝突），略過本次 push，下次執行再試"
+
+            success=false
+            for attempt in 1 2 3; do
+              echo "推送嘗試 $attempt/3"
+              if git pull --rebase origin main; then
+                if git push origin HEAD:main; then
+                  success=true
+                  break
+                else
+                  echo "::warning::第 $attempt 次 push 失敗"
+                fi
+              else
+                echo "::warning::第 $attempt 次 git pull --rebase 失敗，中止 rebase"
+                git rebase --abort || true
+              fi
+            done
+
+            if [ "$success" != "true" ]; then
+              echo "::warning::signals_log 寫回失敗（重試 3 次後仍未成功），略過本次 push，下次執行再試"
             fi
           fi
 
