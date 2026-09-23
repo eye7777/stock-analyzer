@@ -29,3 +29,7 @@ __pycache__/
 # 編輯器暫存
 .vscode/
 *.swp
+
+# 回測快取與輸出（本機產生，不進版控）
+backtest_cache/
+backtest_output/
