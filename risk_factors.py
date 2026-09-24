@@ -13,6 +13,7 @@
 用法
   python risk_factors.py build    # 逐筆重建特徵，寫入 backtest_output/（需先跑過 backtest.py run）
   python risk_factors.py report   # 分組結果、主要對比與 BH 調整（markdown 印到 stdout）
+  python risk_factors.py posthoc  # 事後檢查（不在事先計畫內、不列入檢定）
 """
 
 import os
@@ -123,20 +124,28 @@ def build_factors(start: str, end: str) -> pd.DataFrame:
 
 def attach_outcomes(fac: pd.DataFrame, start: str, end: str) -> pd.DataFrame:
     """每筆訊號補上：是否成交、進場當日觸及停損、T+1／T+5 報酬（未扣成本，
-    定義同 backtest.run_slices）、兩情境的 ret_net（完整 T+19 窗口才計）"""
+    定義同 backtest.run_slices）、兩情境的 ret_net（完整 T+19 窗口才計），
+    以及事後檢查用的 ATR%（訊號日 atr / close）與進場時的停損距離"""
     store = bt.HistoryStore()
     signals = _load_signals(start, end)
     adj_by_sid = {sid: bt.adjusted_prices(store, sid, end) for sid in sa.STOCKS}
     outcomes = bt.build_outcomes(signals, adj_by_sid, buckets=BUCKETS)
+    sig_by_key = signals.set_index(["stock_id", "date"])[["close", "atr", "stop_loss"]]
     rows = []
     for r in fac[["stock_id", "date"]].itertuples(index=False):
         sf = outcomes[(r.stock_id, r.date, "stop_first")]
         tf = outcomes[(r.stock_id, r.date, "target_first")]
+        sig = sig_by_key.loc[(r.stock_id, r.date)]
         filled = sf["status"] in ("closed", "open")
-        rec = {"filled": filled if sf["status"] != "pending" else np.nan}
+        rec = {"filled": filled if sf["status"] != "pending" else np.nan,
+               "atr_pct": sig["atr"] / sig["close"] * 100 if sig["atr"] else np.nan}
         if filled:
             adj = adj_by_sid[r.stock_id]
             e = int(adj.index[adj["date"] == sf["entry_date"]][0])
+            # 進場時的停損距離：停損價換算到還原價基準（同 simulate_trade 的 _scale），
+            # 相對成交價；成交價已在停損之下（開盤跳空）時距離 ≤ 0，R 倍數不定義
+            stop_adj = sig["stop_loss"] * adj.at[e - 1, "close"] / sig["close"]
+            rec["stop_dist"] = 1 - stop_adj / sf["entry_px"]
 
             def ret(k):
                 return adj.at[e + k, "close"] / sf["entry_px"] - 1 if e + k < len(adj) else np.nan
@@ -383,9 +392,95 @@ def run_report(start: str, end: str) -> None:
     print_report(df, meta, res)
 
 
+# ══════════════════════════════════════════════════════════════
+# 事後檢查：看過主要結果後才加的，只作解讀參考，不算 p 值、不列入 BH
+# ══════════════════════════════════════════════════════════════
+
+POSTHOC_CONTRASTS = ("C1", "C5", "C6", "C7")
+R_CONTRASTS = ("C5", "C6", "C7")
+PERIOD_SPLIT = "2024-01-01"
+OVERLAP_COLS = (("ma5_dev_pct_top", "C4 MA5 乖離 Q5"), ("ma20_dev_pct_top", "C5 MA20 乖離 Q5"),
+                ("return_20d_pct_top", "C6 近 20 日漲幅 Q5"), ("chg_hi", "C7 漲幅 ≥ 6%"),
+                ("f1_primary", "C1 爆量長上影"))
+SPEARMAN_VARS = ("price_chg_pct", "volume_ratio", "ma5_dev_pct", "ma20_dev_pct", "return_20d_pct")
+
+
+def print_posthoc(df: pd.DataFrame, meta: dict) -> None:
+    P = print
+    rec = df[(df["bucket"] == bt.SIGNAL_BUCKET) & (df["filled"] == True)]  # noqa: E712
+    con = {c[0]: c for c in contrasts(meta)}
+    late = rec["date"] >= PERIOD_SPLIT
+
+    P("## 事後檢查（不在事先計畫內，只作解讀參考，不列入檢定）\n")
+    P(f"### 時間與波動度（推薦、已成交；期望值 = stop_first ret_net；以 {PERIOD_SPLIT} 切分）\n")
+    P(f"推薦、已成交整體：{PERIOD_SPLIT[:4]} 年起占 {_p(late.mean(), 1)}\n")
+    P("| 風險組 | 2024～2026 年占比（風險組／對照組） | ATR% 中位數（風險組／對照組） | "
+      "2024 年前：風險組／對照組期望值（風險組 n） | 差值 | 2024 年起：風險組／對照組期望值（風險組 n） | 差值 |")
+    P("|---|---|---|---|---|---|---|")
+    for code in POSTHOC_CONTRASTS:
+        _, name, col, _, _ = con[code]
+        a, b = rec[rec[col]], rec[~rec[col]]
+        cells = []
+        for m in (~late, late):
+            s = rec[m]
+            ea, eb = s.loc[s[col], "exp_sf"].mean(), s.loc[~s[col], "exp_sf"].mean()
+            cells.append(f"{_p(ea)}／{_p(eb)}（{int(s[col].sum())}） | {_pp(ea - eb)}")
+        P(f"| {code} {name} | {_p((a['date'] >= PERIOD_SPLIT).mean(), 1)}／{_p((b['date'] >= PERIOD_SPLIT).mean(), 1)} | "
+          f"{a['atr_pct'].median():.2f}／{b['atr_pct'].median():.2f} | {cells[0]} | {cells[1]} |")
+    P()
+
+    P("### 因素重疊（推薦、已成交；列＝符合 A 的訊號中，也符合 B 的比例）\n")
+    P("| A ＼ B | " + " | ".join(n for _, n in OVERLAP_COLS) + " |")
+    P("|---|" + "---|" * len(OVERLAP_COLS))
+    for ca, na in OVERLAP_COLS:
+        g = rec[rec[ca]]
+        P(f"| {na}（n={len(g)}） | " + " | ".join(
+            "—" if cb == ca else _p(g[cb].mean(), 0) for cb, _ in OVERLAP_COLS) + " |")
+    P()
+    corr = rec[list(SPEARMAN_VARS)].corr(method="spearman")
+    P("Spearman 相關係數（推薦、已成交）：\n")
+    P("| | " + " | ".join(SPEARMAN_VARS) + " |")
+    P("|---|" + "---|" * len(SPEARMAN_VARS))
+    for v in SPEARMAN_VARS:
+        P(f"| {v} | " + " | ".join(f"{corr.at[v, w]:.2f}" for w in SPEARMAN_VARS) + " |")
+    P()
+
+    P("### 敏感度：每筆期望值改用 R 倍數（C5～C7，推薦、已成交）\n")
+    P("R 倍數 = stop_first 的 ret_net ÷ 進場時的停損距離%（(成交價 − 停損價) / 成交價，停損價換算到還原價基準）。"
+      "只計完整 T+19 窗口的交易；成交價已在停損之下（停損距離 ≤ 0）的交易 R 不定義、排除。"
+      "95% CI 為 (股票, 年月) 叢集 bootstrap；不算 p 值、不做 BH。\n")
+    ok = rec["exp_sf"].notna()
+    bad = ok & (rec["stop_dist"] <= 0)
+    P(f"排除（停損距離 ≤ 0）：{int(bad.sum())} 筆／{int(ok.sum())} 筆\n")
+    r = rec[ok & ~bad].assign(r_mult=lambda x: x["exp_sf"] / x["stop_dist"])
+    P("| 對比 | 組別 | n | 叢集 | 停損距離% 中位數 | 期望值（%） | 期望值（R） | 差值（R，風險組 − 對照組） |")
+    P("|---|---|---|---|---|---|---|---|")
+    for code in R_CONTRASTS:
+        _, name, col, a_lab, b_lab = con[code]
+        means = {}
+        for flag, lab in ((True, a_lab), (False, b_lab)):
+            g = r[r[col] == flag]
+            lo, hi = bt._cluster_ci(g["r_mult"], g["cluster"])
+            means[flag] = g["r_mult"].mean()
+            diff = f"{means[True] - means[False]:+.3f}" if not flag else ""
+            P(f"| {code if flag else ''} {name if flag else ''} | {lab} | {len(g)} | {g['cluster'].nunique()} | "
+              f"{g['stop_dist'].median() * 100:.2f}% | {_ci_cell(g['exp_sf'], g['cluster'])} | "
+              f"{g['r_mult'].mean():+.3f}R（{lo:+.3f}～{hi:+.3f}） | {diff} |")
+    P()
+
+
+def run_posthoc(start: str, end: str) -> None:
+    if end >= bt.VALIDATION_START:
+        raise SystemExit(f"end 必須早於驗證期起點 {bt.VALIDATION_START}")
+    path = os.path.join(bt.OUTPUT_DIR, f"risk_factors_{_tag(start, end)}.pkl")
+    fac = pd.read_pickle(path) if os.path.exists(path) else build_factors(start, end)
+    df, meta = define_groups(attach_outcomes(fac, start, end))
+    print_posthoc(df, meta)
+
+
 def main():
     ap = argparse.ArgumentParser(description="風險因素切片")
-    ap.add_argument("cmd", choices=["build", "report"])
+    ap.add_argument("cmd", choices=["build", "report", "posthoc"])
     ap.add_argument("--start", default="2012-08-01")
     ap.add_argument("--end", default="2026-06-22")
     args = ap.parse_args()
@@ -393,6 +488,8 @@ def main():
         build_factors(args.start, args.end)
     elif args.cmd == "report":
         run_report(args.start, args.end)
+    elif args.cmd == "posthoc":
+        run_posthoc(args.start, args.end)
 
 
 if __name__ == "__main__":
