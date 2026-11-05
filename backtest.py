@@ -20,6 +20,8 @@
   python backtest.py spread    # spread 欄位交叉比對未還原事件
   python backtest.py run --start 2024-01-01 --end 2026-06-22
   python backtest.py slices    # 法人連買天數切片（需先跑過 run，只讀快取）
+  python backtest.py regime --start 2026-09-21 --end 2026-11-04
+                               # 大盤門檻／燈號／波動上限：修改前後分類對照
 """
 
 import os
@@ -60,6 +62,16 @@ DATASETS = [
 # 「之後」才可用。法定公告期限為次月 10 日。
 REVENUE_PUBLISH_DAY = 10
 
+# 大盤環境用（get_market_data / get_foreign_market_flow）
+MARKET_SERIES = [
+    ("TaiwanStockPrice", "TAIEX"),
+    ("TaiwanStockTotalInstitutionalInvestors", ""),
+]
+MARKET_START = "2012-01-01"
+
+# 美股閘門用（yfinance，與實盤同一資料源）
+YF_TICKERS = ("^SOX", "NVDA")
+
 FUTURES_DATASET = "TaiwanFuturesDaily"
 FUTURES_ID      = "TX"
 FUTURES_START_YEAR = 2017  # 夜盤 2017-05-15 開始
@@ -87,6 +99,10 @@ def _cache_path(dataset: str, stock_id: str) -> str:
     return os.path.join(CACHE_DIR, f"{dataset}_{stock_id}.pkl")
 
 
+def _yf_cache_path(ticker: str) -> str:
+    return os.path.join(CACHE_DIR, f"yfinance_{ticker}.pkl")
+
+
 def fetch_history(stock_ids, refresh: bool = False) -> None:
     """下載 FinMind 可取得的最長歷史（start_date=1990-01-01）到本機快取"""
     os.makedirs(CACHE_DIR, exist_ok=True)
@@ -106,6 +122,32 @@ def fetch_history(stock_ids, refresh: bool = False) -> None:
             pd.DataFrame(data.get("data") or []).to_pickle(path)
             print(f"  cached {ds} {sid}: {len(data.get('data') or [])} rows")
             time.sleep(0.5)
+
+    for ds, sid in MARKET_SERIES:
+        path = _cache_path(ds, sid)
+        if os.path.exists(path) and not refresh:
+            continue
+        resp = requests.get(sa.FINMIND_BASE, params={
+            "dataset": ds, "data_id": sid,
+            "start_date": MARKET_START, "token": sa.FINMIND_TOKEN,
+        }, timeout=120)
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("status") != 200:
+            raise RuntimeError(f"FinMind {ds} ({sid}): {data.get('msg')}")
+        pd.DataFrame(data.get("data") or []).to_pickle(path)
+        print(f"  cached {ds} {sid or '(all)'}: {len(data.get('data') or [])} rows")
+        time.sleep(0.5)
+
+    for ticker in YF_TICKERS:
+        path = _yf_cache_path(ticker)
+        if os.path.exists(path) and not refresh:
+            continue
+        hist = sa.yf.Ticker(ticker).history(start=MARKET_START)
+        if hist.empty:
+            raise RuntimeError(f"yfinance {ticker}: 無資料")
+        hist.to_pickle(path)
+        print(f"  cached yfinance {ticker}: {len(hist)} rows")
 
     path = _cache_path(FUTURES_DATASET, FUTURES_ID)
     if os.path.exists(path) and not refresh:
@@ -299,6 +341,30 @@ def _match(live, bt, tol) -> bool:
     return a == b
 
 
+def _legacy_view(fs: dict) -> dict:
+    """把新版 score_stock 的結果還原成舊規則（沒有外資大賣扣分）的分數與分類"""
+    p = fs.get("foreign_dump_penalty") or 0
+    if not p or fs.get("error"):
+        return fs
+    out = dict(fs)
+    out["chip_score"] = fs["chip_score"] + p
+    out["total_score"] = fs["total_score"] + p
+    out["bucket"] = sa.classify_stock(out)
+    return out
+
+
+def _live_run_date(generated_at) -> str:
+    """signals_log 的 generated_at → 實盤執行時 datetime.today() 的日期（UTC）。
+
+    舊紀錄是 UTC 的 naive 時間；2026-11 起改成台北時間並附 "+08:00"。
+    """
+    g = str(generated_at)
+    if g.endswith("+08:00"):
+        t = datetime.strptime(g[:19], "%Y-%m-%d %H:%M:%S") - timedelta(hours=8)
+        return t.strftime("%Y-%m-%d")
+    return g[:10]
+
+
 def run_parity(log_path: str = sa.SIGNALS_LOG_PATH) -> pd.DataFrame:
     df_log = sa.read_signals_log(log_path)
     store = HistoryStore()
@@ -306,12 +372,19 @@ def run_parity(log_path: str = sa.SIGNALS_LOG_PATH) -> pd.DataFrame:
     for _, r in df_log.iterrows():
         sid = str(r["stock_id"])
         data_date = str(r["data_date"])
-        run_date = str(r["generated_at"])[:10]  # 實盤 datetime.today()（UTC）
+        run_date = _live_run_date(r["generated_at"])  # 實盤 datetime.today()（UTC）
         fs = compute_signal(store, sid, data_date, run_date)
+        if _norm(r.get("threshold_used")) is None:
+            # 2026-11 以前的紀錄沒有外資大賣扣分，用舊規則口徑比對
+            fs = _legacy_view(fs)
         bt_date = (str(fs["price_series"]["date"].iloc[-1])
                    if not fs["price_series"].empty else None)
         for name, col, getter, tol in PARITY_FIELDS:
             live, bt = r[col], getter(fs)
+            if col == "bucket" and _norm(r.get("raw_bucket")) is not None:
+                # 新紀錄的 bucket 含大盤門檻與降級；回測的 bucket 只依分數，
+                # 要跟 raw_bucket（同一口徑）比
+                live = r["raw_bucket"]
             rows.append({
                 "data_date": data_date, "stock_id": sid, "name": r["name"],
                 "field": name, "live": _norm(live), "backtest": _norm(bt),
@@ -1007,9 +1080,181 @@ def run_slices(start: str, end: str) -> None:
         P(f"| {score} | {len(g)} | {g['cluster'].nunique()} | {_p(g['ret'].mean())} | {_p(lo)}～{_p(hi)} |")
 
 
+# ══════════════════════════════════════════════════════════════
+# 大盤門檻／燈號／波動上限：修改前後對照
+# ══════════════════════════════════════════════════════════════
+
+def load_yf_cache() -> dict:
+    out = {}
+    for ticker in YF_TICKERS:
+        path = _yf_cache_path(ticker)
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"缺少快取 {path}，請先執行 python backtest.py fetch")
+        out[ticker] = pd.read_pickle(path)
+    return out
+
+
+def compute_context(store: HistoryStore, as_of: str, night_as_of: "str | None", yf_hist: dict) -> dict:
+    """重建 as_of 收盤後（隔天清晨執行）的 regime context：直接呼叫實盤的函式"""
+    enter, exit_ = _patched(store, as_of, as_of, night_as_of)
+    enter()
+    try:
+        fut = sa.get_futures_gate()
+        md  = sa.get_market_data()
+        ff  = sa.get_foreign_market_flow()
+    finally:
+        exit_()
+    us = {}
+    for key, (ticker, label) in sa.US_SYMBOLS.items():
+        if ticker not in yf_hist:
+            continue
+        try:
+            us[key] = sa.us_quote_from_hist(yf_hist[ticker], label, as_of)
+        except Exception as e:
+            us[key] = {"label": label, "close": "N/A", "chg_pct": None, "chg_str": "N/A",
+                       "date": None, "error": str(e)}
+    ctx = sa.build_regime_context(fut, us, sa.get_market_regime(md, ff))
+    ctx["_us"] = us
+    return ctx
+
+
+def _context_anomalies(ctx: dict, as_of: str, night_as_of: "str | None") -> list:
+    """資料日期對不上、缺漏的情況逐條列出（不補值）"""
+    out = []
+    fut = ctx["gate"]["futures"]
+    if night_as_of is None:
+        out.append("台指期：快取中沒有 as_of 之後的夜盤")
+    elif fut.get("error"):
+        out.append(f"台指期：{fut['error']}")
+    else:
+        if fut.get("night_date") != night_as_of:
+            out.append(f"台指期夜盤日期 {fut.get('night_date')} ≠ 預期 {night_as_of}")
+        if fut.get("settlement_date") != as_of:
+            out.append(f"台指期結算日 {fut.get('settlement_date')} ≠ {as_of}")
+    md = ctx["regime"]["market"]
+    if md.get("error") or md.get("ma20") is None:
+        out.append(f"TAIEX：{md.get('error') or 'MA20 資料不足'}")
+    elif md.get("date") != as_of:
+        out.append(f"TAIEX 最新日期 {md.get('date')} ≠ {as_of}")
+    ff = ctx["regime"]["foreign_flow"]
+    if ff.get("error"):
+        out.append(f"外資買賣超：{ff['error']}")
+    elif ff.get("date") != as_of:
+        out.append(f"外資買賣超最新日期 {ff.get('date')} ≠ {as_of}")
+    for key in ("SOX", "NVDA"):
+        q = ctx["_us"].get(key) or {}
+        if q.get("error"):
+            out.append(f"{key}：{q['error']}")
+        elif q.get("date") != as_of:
+            out.append(f"{key} 最新日期 {q.get('date')} ≠ {as_of}（美股休市或資料延遲）")
+    return out
+
+
+def _reason_kind(reason: str) -> str:
+    if reason.startswith("未達今日推薦門檻"):
+        return "門檻提高"
+    if reason.startswith("紅燈"):
+        return "紅燈"
+    if reason.startswith("波動過大"):
+        return "波動過大"
+    return reason
+
+
+def run_regime(start: str, end: str, log_path: str = sa.SIGNALS_LOG_PATH) -> None:
+    """[start, end] 每個交易日：修改前（舊分數、只依分數分類）vs 修改後（新分數＋門檻＋燈號＋波動上限）"""
+    store = HistoryStore()
+    yf_hist = load_yf_cache()
+    df_log = sa.read_signals_log(log_path)
+    live = {(str(r["data_date"]), str(r["stock_id"])): r for _, r in df_log.iterrows()}
+
+    fut = store._load(FUTURES_DATASET, FUTURES_ID)
+    night_dates = sorted(fut.loc[fut["trading_session"] == "after_market", "date"].unique())
+    dates = sorted(store.query("TaiwanStockPrice", "TAIEX", start, end)["date"].unique())
+
+    rows, ctx_rows = [], []
+    for d in dates:
+        nxt = [x for x in night_dates if x > d][:1]
+        night_as_of = nxt[0] if nxt else None
+        ctx = compute_context(store, d, night_as_of, yf_hist)
+        anomalies = _context_anomalies(ctx, d, night_as_of)
+        ctx_rows.append({
+            "date": d, "gate": ctx["gate"]["label"],
+            "indicators": "；".join(f"{i['name']} {i['value']} {i['label']}" for i in ctx["gate"]["indicators"]),
+            "threshold": ctx["threshold"], "threshold_reasons": "、".join(ctx["threshold_reasons"]),
+            "anomalies": "；".join(anomalies),
+        })
+        for sid in sa.STOCKS:
+            lr = live.get((d, sid))
+            run_date = _live_run_date(lr["generated_at"]) if lr is not None else d
+            fs = compute_signal(store, sid, d, run_date)
+            if fs.get("error"):
+                rows.append({"date": d, "stock_id": sid, "name": sa.STOCKS[sid], "error": fs["error"]})
+                continue
+            old = _legacy_view(fs)
+            det = sa.classify_stock_detail(fs, ctx)
+            reasons = list(det["demote_reasons"])
+            if old["bucket"] == "推薦" and det["raw_bucket"] != "推薦" and fs.get("foreign_dump_penalty"):
+                reasons.insert(0, "外資大賣扣分後未達 7 分")
+            rows.append({
+                "date": d, "stock_id": sid, "name": sa.STOCKS[sid],
+                "old_total": old["total_score"], "new_total": fs["total_score"],
+                "penalty": fs.get("foreign_dump_penalty", 0),
+                "threshold": ctx["threshold"], "gate": ctx["gate"]["label"],
+                "stop_pct": det["stop_pct"],
+                "old_bucket": old["bucket"], "new_raw_bucket": det["raw_bucket"], "new_bucket": det["bucket"],
+                "live_bucket": None if lr is None else lr["bucket"],
+                "live_total": None if lr is None else lr["total_score"],
+                "reasons": "；".join(reasons),
+                "error": None,
+            })
+
+    out = pd.DataFrame(rows)
+    ctx_df = pd.DataFrame(ctx_rows)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    out.to_csv(os.path.join(OUTPUT_DIR, f"regime_compare_{start}_{end}.csv"), index=False)
+    ctx_df.to_csv(os.path.join(OUTPUT_DIR, f"regime_context_{start}_{end}.csv"), index=False)
+
+    ok = out[out["error"].isna()]
+    print(f"\n交易日 {len(dates)} 天，個股日 {len(ok)} 筆（錯誤 {out['error'].notna().sum()} 筆）")
+    bad = ctx_df[ctx_df["anomalies"] != ""]
+    print(f"資料異常的日期：{len(bad)} 天")
+    if not bad.empty:
+        print(bad[["date", "anomalies"]].to_string(index=False))
+
+    has_live = ok[ok["live_bucket"].notna()]
+    mism = has_live[(has_live["old_bucket"] != has_live["live_bucket"]) |
+                    (has_live["old_total"] != has_live["live_total"])]
+    print(f"\n修改前（回測重建）vs 實盤 signals_log：比對 {len(has_live)} 筆，分數或分類不符 {len(mism)} 筆")
+    if not mism.empty:
+        print(mism[["date", "name", "old_total", "live_total", "old_bucket", "live_bucket"]].to_string(index=False))
+
+    print("\n每日燈號與門檻：")
+    print(ctx_df[["date", "gate", "threshold", "threshold_reasons", "indicators"]].to_string(index=False))
+
+    print("\n分類筆數：")
+    print(pd.DataFrame({
+        "修改前": ok["old_bucket"].value_counts(),
+        "修改後": ok["new_bucket"].value_counts(),
+    }).fillna(0).astype(int).to_string())
+
+    demoted = ok[(ok["old_bucket"] == "推薦") & (ok["new_bucket"] != "推薦")]
+    print(f"\n修改前推薦 {int((ok['old_bucket'] == '推薦').sum())} 筆 → 修改後推薦 "
+          f"{int((ok['new_bucket'] == '推薦').sum())} 筆；被降級 {len(demoted)} 筆")
+    kinds = demoted["reasons"].str.split("；").explode().map(_reason_kind)
+    print("降級原因分布（一筆可多個原因）：")
+    print(kinds.value_counts().to_string())
+    print("\n被降級明細：")
+    print(demoted[["date", "name", "old_total", "new_total", "threshold", "gate", "stop_pct", "reasons"]]
+          .to_string(index=False))
+    upgraded = ok[(ok["old_bucket"] != "推薦") & (ok["new_bucket"] == "推薦")]
+    if not upgraded.empty:
+        print("\n⚠️ 修改後新增的推薦（不應出現）：")
+        print(upgraded.to_string(index=False))
+
+
 def main():
     ap = argparse.ArgumentParser(description="stock_analyzer baseline 回測")
-    ap.add_argument("cmd", choices=["fetch", "parity", "spread", "run", "slices"])
+    ap.add_argument("cmd", choices=["fetch", "parity", "spread", "run", "slices", "regime"])
     ap.add_argument("--refresh", action="store_true", help="fetch：重新下載已存在的快取")
     ap.add_argument("--start", default="2012-08-01")
     ap.add_argument("--seeds", type=int, default=PORTFOLIO_SEEDS)
@@ -1036,6 +1281,8 @@ def main():
         run_backtest(args.start, args.end, args.seeds)
     elif args.cmd == "slices":
         run_slices(args.start, args.end)
+    elif args.cmd == "regime":
+        run_regime(args.start, args.end)
 
 
 if __name__ == "__main__":

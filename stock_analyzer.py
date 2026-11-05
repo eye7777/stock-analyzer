@@ -13,7 +13,9 @@ import logging
 import subprocess
 import traceback
 import smtplib
+import argparse
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
@@ -101,6 +103,80 @@ SIGNALS_LOG_DIR  = os.path.join(_DIR, "data")
 SIGNALS_LOG_PATH = os.path.join(SIGNALS_LOG_DIR, "signals_log.csv")
 
 # ══════════════════════════════════════════════════════════════
+# 大盤環境與風險過濾門檻（集中在此調整）
+# ══════════════════════════════════════════════════════════════
+# 推薦門檻：基礎 7 分，依大盤環境／燈號往上加，最高 9 分。
+# 觀望區 = WATCH_MIN_SCORE ≤ 總分 < 今日推薦門檻。
+BASE_RECOMMEND_SCORE = 7
+MAX_RECOMMEND_SCORE  = 9
+WATCH_MIN_SCORE      = 5
+
+# 台指期夜盤閘門：夜盤收盤 − 前一日結算價（點）
+TX_RED_PTS    = -200
+TX_YELLOW_PTS = -100
+
+# 美股指標閘門：前一晚日漲跌幅（%）
+SOX_YELLOW_PCT  = -2.0
+SOX_RED_PCT     = -3.0
+NVDA_YELLOW_PCT = -3.0
+
+# 大盤環境：加權指數收盤 < MA(N) → 門檻 +1；外資對大盤連續賣超 ≥ N 日 → 門檻 +1
+TAIEX_MA_DAYS               = 20
+MARKET_DATA_LOOKBACK_DAYS   = 45   # 抓 45 個日曆天，確保夠算 MA20
+FOREIGN_SELL_STREAK_DAYS    = 3
+FOREIGN_FLOW_LOOKBACK_DAYS  = 20
+# 外資 = 外資及陸資（不含自營商）+ 外資自營商
+FOREIGN_INVESTOR_NAMES      = ("Foreign_Investor", "Foreign_Dealer_Self")
+REGIME_ADD_BELOW_MA         = 1
+REGIME_ADD_FOREIGN_SELL     = 1
+REGIME_ADD_YELLOW           = 1
+# 加權指數與外資買賣超的最新日期對不上（其中一邊延遲更新）比照資料缺漏 +1
+REGIME_ADD_DATE_MISMATCH    = 1
+
+# 籌碼面：投信買超 > 0 且 外資賣超張數 ≥ 投信買超張數 × N 時，籌碼分數 −1（最低 0）
+FOREIGN_DUMP_MULTIPLE = 3
+FOREIGN_DUMP_PENALTY  = 1
+
+# 波動上限：停損距離 =（收盤 − 停損價）÷ 收盤，超過此百分比不列入推薦
+# （停損距離不應超過台股單日跌停幅度 10%）
+MAX_STOP_PCT = 10.0
+
+# 報告時間戳記時區
+TPE_TZ = ZoneInfo("Asia/Taipei")
+
+# 指定資料日期（--date）時設定；None 代表即時模式。FinMind 請求會加上
+# end_date，yfinance 只取到該日（美東）為止的收盤。
+AS_OF: "str | None" = None
+
+GATE_RANK   = {"green": 0, "yellow": 1, "red": 2}
+GATE_STYLE  = {
+    "green":  {"emoji": "🟢", "label": "綠燈"},
+    "yellow": {"emoji": "🟡", "label": "黃燈"},
+    "red":    {"emoji": "🔴", "label": "紅燈"},
+}
+GATE_ACTION = {
+    "green":  "可依評分正常操作",
+    "yellow": f"推薦門檻 +{REGIME_ADD_YELLOW}、降低倉位",
+    "red":    "今日不出推薦清單，達標個股改列觀望",
+}
+
+
+def now_tpe() -> datetime:
+    """台北時間的現在時刻（報告「產生時間」等顯示用）"""
+    return datetime.now(TPE_TZ)
+
+
+def _today() -> datetime:
+    """資料抓取窗口的「今天」：--date 模式為指定日期，否則為 datetime.today()。
+
+    即時模式沿用 datetime.today()（CI 為 UTC，22:33 執行時即資料日），
+    backtest.py 對 sa.datetime 的 monkeypatch 也是透過這裡生效。
+    """
+    if AS_OF:
+        return datetime.strptime(AS_OF, "%Y-%m-%d")
+    return datetime.today()
+
+# ══════════════════════════════════════════════════════════════
 # 日誌設定
 # ══════════════════════════════════════════════════════════════
 LOG_FILE = os.path.join(_DIR, "analyzer.log")
@@ -137,6 +213,12 @@ def _finmind_request(dataset: str, stock_id: str, start_date: str) -> "tuple[pd.
             "start_date": start_date,
             "token": FINMIND_TOKEN,
         }
+        if AS_OF:
+            # 夜盤標在「所屬的下一個交易日」，要多抓幾天再由 _clip_futures_as_of 篩
+            end = AS_OF
+            if dataset == "TaiwanFuturesDaily":
+                end = (datetime.strptime(AS_OF, "%Y-%m-%d") + timedelta(days=10)).strftime("%Y-%m-%d")
+            params["end_date"] = end
         resp = requests.get(FINMIND_BASE, params=params, timeout=30)
         resp.raise_for_status()
         data = resp.json()
@@ -147,10 +229,53 @@ def _finmind_request(dataset: str, stock_id: str, start_date: str) -> "tuple[pd.
         if not data.get("data"):
             return pd.DataFrame(), None
 
-        return pd.DataFrame(data["data"]), None
+        df = pd.DataFrame(data["data"])
+        if AS_OF and dataset == "TaiwanFuturesDaily":
+            df = _clip_futures_as_of(df, AS_OF)
+        if AS_OF and dataset == "TaiwanStockMonthRevenue":
+            df = _clip_revenue_as_of(df, AS_OF)
+        return df, None
 
     except Exception as e:
         return pd.DataFrame(), str(e)
+
+
+def _clip_revenue_as_of(df: pd.DataFrame, as_of: str) -> pd.DataFrame:
+    """--date 模式：只保留 as_of 當天（含）以前已公告的月營收，避免偷看未來。
+
+    FinMind 的 date 是營收月份的次月 1 日，不是公告日，光用 end_date 會把
+    as_of 之後才公告的營收也抓進來（例：2301 九月營收 2026-10-09 才公告，
+    date 卻是 2026-10-01）。有 create_time 時以它為準；沒有時（2026-04 以前
+    的資料）沿用 backtest.py 的保守規則：次月 10 日之後才可取得。
+    """
+    if df.empty or "date" not in df.columns:
+        return df
+    created = df["create_time"].astype(str).str[:10] if "create_time" in df.columns else None
+    fallback = df["date"].astype(str).str[:8] + "10"
+    if created is not None:
+        has_ct = created.str.match(r"^\d{4}-\d{2}-\d{2}$")
+        keep = (has_ct & (created <= as_of)) | (~has_ct & (fallback < as_of))
+    else:
+        keep = fallback < as_of
+    return df[keep].reset_index(drop=True)
+
+
+def _clip_futures_as_of(df: pd.DataFrame, as_of: str) -> pd.DataFrame:
+    """--date 模式：重現資料日 as_of 收盤後、隔天清晨執行時看得到的台指期資料。
+
+    與 backtest.HistoryStore.query 相同的規則：FinMind 把夜盤（D 日 15:00～
+    D+1 日 05:00）標在它所屬的下一個交易日，所以日盤取到 as_of，夜盤取到
+    as_of 之後的第一個夜盤日期。
+    """
+    if df.empty or not {"date", "trading_session"}.issubset(df.columns):
+        return df
+    df = df.copy()
+    df["date"] = df["date"].astype(str)
+    is_night = df["trading_session"] == "after_market"
+    later_nights = sorted(d for d in df.loc[is_night, "date"].unique() if d > as_of)
+    night_as_of = later_nights[0] if later_nights else as_of
+    keep = (~is_night & (df["date"] <= as_of)) | (is_night & (df["date"] <= night_as_of))
+    return df[keep].reset_index(drop=True)
 
 
 def finmind_get(dataset: str, stock_id: str, start_date: str) -> pd.DataFrame:
@@ -177,35 +302,96 @@ US_SYMBOLS = {
 }
 
 
-def get_us_market_data() -> dict:
-    """使用 yfinance 抓取美股前一交易日收盤數據"""
-    log.info("抓取美股數據（yfinance）...")
+def us_quote_from_hist(hist: pd.DataFrame, label: str, as_of: "str | None" = None) -> dict:
+    """由 yfinance history（index 為日期、含 Close 欄）算出最後一個交易日的漲跌幅。
 
-    if not HAS_YFINANCE:
-        log.warning("⚠️  yfinance 未安裝，跳過美股數據")
-        return {}
+    as_of 不為 None 時只看美東日期 ≤ as_of 的資料（台北 as_of 晚間對應的
+    美股交易日即美東 as_of）。資料不足時 raise，由呼叫端標示缺漏。
+    backtest.py 也直接呼叫這個函式（傳入快取的 history）。
+    """
+    if hist is None or hist.empty or "Close" not in hist.columns:
+        raise ValueError("無資料")
+    h = hist.copy()
+    h.index = pd.to_datetime(h.index)
+    h["_d"] = [d.strftime("%Y-%m-%d") for d in h.index]
+    if as_of:
+        h = h[h["_d"] <= as_of]
+    h = h[pd.to_numeric(h["Close"], errors="coerce") > 0]
+    if len(h) < 2:
+        raise ValueError("資料筆數不足")
+    prev  = float(h["Close"].iloc[-2])
+    last  = float(h["Close"].iloc[-1])
+    chg_p = (last - prev) / prev * 100
+    return {
+        "label":   label,
+        "close":   round(last, 2),
+        "chg_pct": round(chg_p, 2),
+        "chg_str": f"{'+' if chg_p >= 0 else ''}{chg_p:.2f}%",
+        "date":    h["_d"].iloc[-1],
+        "error":   None,
+    }
+
+
+def get_us_market_data(as_of: "str | None" = None) -> dict:
+    """使用 yfinance 抓取美股前一交易日收盤數據
+
+    抓取失敗的標的 error 欄位非 None、chg_pct 為 None——閘門判斷會把它當成
+    「資料缺漏」（黃燈），不可當成 0% 漲跌。
+    """
+    log.info("抓取美股數據（yfinance）...")
 
     result = {}
     for key, (ticker, label) in US_SYMBOLS.items():
         try:
-            hist = yf.Ticker(ticker).history(period="5d")
-            if len(hist) < 2:
-                raise ValueError("資料筆數不足")
-            prev  = float(hist["Close"].iloc[-2])
-            last  = float(hist["Close"].iloc[-1])
-            chg_p = (last - prev) / prev * 100 if prev else 0.0
-            result[key] = {
-                "label":   label,
-                "close":   round(last, 2),
-                "chg_pct": round(chg_p, 2),
-                "chg_str": f"{'+' if chg_p >= 0 else ''}{chg_p:.2f}%",
-            }
-            log.info(f"  ✅ {label}（{ticker}）：{result[key]['close']}  {result[key]['chg_str']}")
+            if not HAS_YFINANCE:
+                raise RuntimeError("yfinance 未安裝")
+            if as_of:
+                end = (datetime.strptime(as_of, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+                start = (datetime.strptime(as_of, "%Y-%m-%d") - timedelta(days=10)).strftime("%Y-%m-%d")
+                hist = yf.Ticker(ticker).history(start=start, end=end)
+            else:
+                hist = yf.Ticker(ticker).history(period="5d")
+            result[key] = us_quote_from_hist(hist, label, as_of)
+            log.info(f"  ✅ {label}（{ticker}）{result[key]['date']}：{result[key]['close']}  {result[key]['chg_str']}")
         except Exception as e:
             log.warning(f"  ⚠️  yfinance 抓取 {ticker} 失敗：{e}")
-            result[key] = {"label": label, "close": "N/A", "chg_pct": 0.0, "chg_str": "N/A"}
+            result[key] = {"label": label, "close": "N/A", "chg_pct": None, "chg_str": "N/A",
+                           "date": None, "error": str(e)}
 
     return result
+
+
+def _gate_entry(name: str, status: str, value: str, rule: str, missing: bool = False) -> dict:
+    return {
+        "name": name, "status": status, "value": value, "rule": rule,
+        "missing": missing, **GATE_STYLE[status],
+    }
+
+
+def get_us_gate_indicators(us_market: dict) -> list:
+    """費半（SOX）與 NVIDIA 前一晚漲跌幅 → 各自燈號；抓取失敗一律「資料缺漏」黃燈"""
+    out = []
+    specs = [
+        ("SOX",  "費半（^SOX）",
+         [(SOX_RED_PCT, "red"), (SOX_YELLOW_PCT, "yellow")],
+         f"≤{SOX_YELLOW_PCT:g}% 黃／≤{SOX_RED_PCT:g}% 紅"),
+        ("NVDA", "NVIDIA（NVDA）",
+         [(NVDA_YELLOW_PCT, "yellow")],
+         f"≤{NVDA_YELLOW_PCT:g}% 黃"),
+    ]
+    for key, name, cuts, rule in specs:
+        q = (us_market or {}).get(key) or {}
+        chg = q.get("chg_pct")
+        if q.get("error") or chg is None:
+            out.append(_gate_entry(name, "yellow", f"資料缺漏（{q.get('error') or '未取得'}）", rule, missing=True))
+            continue
+        status = "green"
+        for cut, st in cuts:
+            if chg <= cut:
+                status = st
+                break
+        out.append(_gate_entry(name, status, f"{q.get('chg_str')}（{q.get('date')}）", rule))
+    return out
 
 
 # ══════════════════════════════════════════════════════════════
@@ -220,8 +406,23 @@ _SEARCH_KEYWORDS = [
 ]
 
 
-def get_us_news_analysis(us_data: dict) -> dict:
-    """兩步驟：① Claude web_search 搜尋新聞；② 結構化輸出影響分析"""
+_NEWS_RULES = (
+    "【撰寫規則（必須遵守）】\n"
+    "1. 每則新聞都要寫出事件發生或揭露的日期（YYYY-MM-DD）；查不到日期就寫「日期不明」。\n"
+    "2. 「前一晚」指台北時間 {night}；不是在這段期間發生或首次揭露的消息，一律標明「舊聞」。\n"
+    "3. 原始資料中的限定詞（例如「上限」「最高」「預估」「預計」「傳聞」「據報導」「消息人士」「可能」）"
+    "必須原樣保留，不得省略或改寫成確定語氣。\n"
+    "4. 不得對個股或大盤做方向性預測或操作建議（例如「逆勢可期」「可望上漲」「有望走強」「建議布局」），"
+    "只陳述事實與受影響的產業／標的。\n"
+)
+
+
+def get_us_news_analysis(us_data: dict, ref_date: "str | None" = None) -> dict:
+    """兩步驟：① Claude web_search 搜尋新聞；② 結構化輸出影響分析
+
+    新聞只作為報告的參考資訊，不進入 score_stock()，也不影響任何分類。
+    ref_date：前一晚美股交易日（美東日期）；None 時取 us_data 裡最新的日期。
+    """
     log.info("使用 Claude web_search 搜尋最新財經新聞...")
 
     client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
@@ -230,12 +431,20 @@ def get_us_news_analysis(us_data: dict) -> dict:
         f"{v['label']} {v['chg_str']}" for v in us_data.values() if isinstance(v, dict)
     ) or "（美股數據未取得）"
 
+    if ref_date is None:
+        dates = [v.get("date") for v in us_data.values() if isinstance(v, dict) and v.get("date")]
+        ref_date = max(dates) if dates else _today().strftime("%Y-%m-%d")
+    ref_dt = datetime.strptime(ref_date, "%Y-%m-%d")
+    night  = f"{ref_dt:%Y-%m-%d} 晚間至 {ref_dt + timedelta(days=1):%Y-%m-%d} 清晨（美東 {ref_date} 交易時段）"
+    rules  = _NEWS_RULES.format(night=night)
+
     # ── 步驟一：web_search 搜尋 ────────────────────────────────
     keywords_str = "\n".join(f'{i+1}. "{kw}"' for i, kw in enumerate(_SEARCH_KEYWORDS))
     search_prompt = (
-        f"請搜尋以下關鍵字的今日最新財經新聞：\n{keywords_str}\n\n"
+        f"請搜尋以下關鍵字、{ref_date}（美東）前後的最新財經新聞：\n{keywords_str}\n\n"
         f"昨夜美股：{us_summary}\n\n"
-        "搜尋後請整理出最重要的 2-3 則新聞標題與摘要。"
+        "搜尋後請整理出最重要的 2-3 則新聞標題與摘要，每則附上事件發生或揭露的日期與來源。\n\n"
+        f"{rules}"
     )
 
     news_text = ""
@@ -257,17 +466,18 @@ def get_us_news_analysis(us_data: dict) -> dict:
 
     # ── 步驟二：結構化分析 ──────────────────────────────────────
     analysis_prompt = (
-        f"根據以下新聞內容和美股數據，分析對台股的影響。\n\n"
+        f"根據以下新聞內容和美股數據，整理可能與台股標的相關的消息（僅供參考，不做預測）。\n\n"
         f"【昨夜美股】{us_summary}\n\n"
         f"【新聞內容】\n{news_text[:3000]}\n\n"
+        f"{rules}\n"
         f"請呼叫 output_news_analysis 工具，輸出：\n"
-        f"1. 2-3 則最重要的新聞，說明各自對哪些台股標的有影響（{stocks_list}）\n"
-        f"2. 今日開盤前一句話提示（30 字以內）"
+        f"1. 2-3 則最重要的新聞，標注事件日期與是否為舊聞，說明各自涉及哪些台股標的（{stocks_list}）\n"
+        f"2. 今日開盤前一句話提示（30 字以內，只陳述事實，不做方向性預測）"
     )
 
     output_tools = [{
         "name": "output_news_analysis",
-        "description": "輸出結構化新聞分析結果",
+        "description": "輸出結構化新聞整理結果（參考資訊，不影響評分）",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -276,15 +486,18 @@ def get_us_news_analysis(us_data: dict) -> dict:
                     "items": {
                         "type": "object",
                         "properties": {
-                            "title":           {"type": "string", "description": "新聞標題（25字內）"},
-                            "summary":         {"type": "string", "description": "新聞摘要（60字內）"},
-                            "affected_stocks": {"type": "string", "description": "影響的台股標的及說明"},
-                            "impact":          {"type": "string", "enum": ["正面", "負面", "中性"]},
+                            "title":           {"type": "string", "description": "新聞標題（25字內），保留原文限定詞"},
+                            "event_date":      {"type": "string", "description": "事件發生或揭露日期 YYYY-MM-DD；不明則填「日期不明」"},
+                            "is_old_news":     {"type": "boolean", "description": f"不是在前一晚（台北 {night}）發生或首次揭露者為 true"},
+                            "summary":         {"type": "string", "description": "新聞摘要（60字內），保留「上限」「預估」「傳聞」等限定詞，不做預測"},
+                            "affected_stocks": {"type": "string", "description": "涉及的台股標的與關聯（只陳述關聯，不寫漲跌預測或操作建議）"},
+                            "impact":          {"type": "string", "enum": ["正面", "負面", "中性"],
+                                                "description": "消息本身對相關產業的性質，不是股價預測"},
                         },
-                        "required": ["title", "summary", "affected_stocks", "impact"],
+                        "required": ["title", "event_date", "is_old_news", "summary", "affected_stocks", "impact"],
                     },
                 },
-                "key_alert": {"type": "string", "description": "今日開盤前最重要提示（30字內）"},
+                "key_alert": {"type": "string", "description": "今日開盤前最重要提示（30字內），只陳述事實，不做方向性預測"},
             },
             "required": ["news_items", "key_alert"],
         },
@@ -301,6 +514,12 @@ def get_us_news_analysis(us_data: dict) -> dict:
         for block in analysis_resp.content:
             if block.type == "tool_use" and block.name == "output_news_analysis":
                 result = block.input
+                # 舊聞判斷不只依賴 LLM：事件日期不在「前一晚」（美東 ref_date 或
+                # 台北隔天清晨）就強制標舊聞；日期不明的也不能當成前一晚的消息。
+                fresh = {ref_date, (ref_dt + timedelta(days=1)).strftime("%Y-%m-%d")}
+                for item in result.get("news_items", []):
+                    if str(item.get("event_date", ""))[:10] not in fresh:
+                        item["is_old_news"] = True
                 log.info(f"  ✅ 新聞分析完成：{len(result.get('news_items', []))} 則")
                 return result
     except Exception as e:
@@ -595,10 +814,13 @@ def score_stock(s: dict) -> dict:
 
     規則與原本寫在 Claude prompt 內的完全一致：
       基本面（max 2）：avg_yoy≥30%→2，15–30%→1，其他→0
-      籌碼面（max 4）：外資買超 +1，外資連買≥3日再 +1，投信買超 +1，投信連買≥3日再 +1
+      籌碼面（max 4）：外資買超 +1，外資連買≥3日再 +1，投信買超 +1，投信連買≥3日再 +1；
+                      投信買超 > 0 且外資賣超張數 ≥ 投信買超張數 × FOREIGN_DUMP_MULTIPLE
+                      時再 −FOREIGN_DUMP_PENALTY（最低 0），原因寫在 chip_notes
       技術面（max 4）：站上MA5 +1，站上MA20 +1，KD黃金交叉且K<80再 +1，
                       量比>1.2且當日收紅再 +1
-      total_score = 三項加總；recommend = total_score ≥ 7
+      total_score = 三項加總；recommend = total_score ≥ BASE_RECOMMEND_SCORE
+      （僅依分數；實際是否推薦還要經過 classify_stock 的大盤門檻與風險過濾）
     """
     # ── 基本面（max 2）──
     avg_yoy = s.get("avg_yoy")
@@ -622,6 +844,19 @@ def score_stock(s: dict) -> dict:
         if s.get("trust_consec", 0) >= 3:
             chip += 1
 
+    # 外資大賣扣分：只在投信買超 > 0 時套用
+    chip_notes = []
+    dump_penalty = 0
+    trust_net   = s.get("trust_net", 0) or 0
+    foreign_net = s.get("foreign_net", 0) or 0
+    if trust_net > 0 and foreign_net < 0 and -foreign_net >= trust_net * FOREIGN_DUMP_MULTIPLE:
+        dump_penalty = min(FOREIGN_DUMP_PENALTY, chip)
+        chip -= dump_penalty
+        chip_notes.append(
+            f"外資賣超 {-foreign_net:,} 張 ≥ 投信買超 {trust_net:,} 張×{FOREIGN_DUMP_MULTIPLE}"
+            f"（{trust_net * FOREIGN_DUMP_MULTIPLE:,} 張），籌碼 −{dump_penalty}"
+        )
+
     # ── 技術面（max 4）──
     technical = 0
     if s.get("above_ma5"):
@@ -639,7 +874,9 @@ def score_stock(s: dict) -> dict:
         "chip_score":        int(chip),
         "technical_score":   int(technical),
         "total_score":       int(total),
-        "recommend":         bool(total >= 7),
+        "recommend":         bool(total >= BASE_RECOMMEND_SCORE),
+        "chip_notes":        chip_notes,
+        "foreign_dump_penalty": int(dump_penalty),
     }
 
 
@@ -678,24 +915,112 @@ def calc_trade_levels(close, atr) -> dict:
     }
 
 
-def classify_stock(s: dict) -> str:
-    """依 data_warning 與 total_score，回傳這檔股票所屬分類：
-    「警示」／「推薦」／「觀望」／「暫不關注」
+def calc_stop_pct(close, stop_loss) -> "float | None":
+    """停損距離% =（收盤 − 停損價）÷ 收盤 × 100；任一值無效時回傳 None"""
+    try:
+        c, sl = float(close), float(stop_loss)
+    except (TypeError, ValueError):
+        return None
+    if c <= 0:
+        return None
+    return round((c - sl) / c * 100, 2)
 
-    email（compose_email_html）與訊號日誌（signals_log）共用這個函式，
-    確保兩邊口徑一致。門檻與原本寫在 compose_email_html 裡的完全相同
-    （≥7 推薦、5–6 觀望、<5 暫不關注，有 data_warning 一律歸警示），只是
-    把判斷抽成共用函式，沒有改變任何規則，也沒有動 score_stock 本身。
+
+def classify_stock_detail(s: dict, ctx: "dict | None" = None) -> dict:
+    """回傳分類與降級原因：
+      bucket：「警示」／「推薦」／「觀望」／「暫不關注」（經大盤門檻與風險過濾）
+      raw_bucket：只依分數（≥BASE 推薦、≥WATCH 觀望），未經門檻與降級調整
+      demote_reasons：raw_bucket 為推薦、bucket 不是推薦的原因（可能多個）
+      stop_pct：停損距離%
+
+    ctx 為 None 時沒有大盤資訊，bucket = raw_bucket（backtest.py 的
+    baseline 回測走這條路）。有 data_warning 一律歸警示。
     """
+    total    = s.get("total_score", 0)
+    stop_pct = calc_stop_pct(s.get("close"), s.get("stop_loss"))
+
     if s.get("data_warning"):
-        return "警示"
-    total = s.get("total_score", 0)
-    if total >= 7:
-        return "推薦"
-    elif total >= 5:
-        return "觀望"
+        raw = "警示"
+    elif total >= BASE_RECOMMEND_SCORE:
+        raw = "推薦"
+    elif total >= WATCH_MIN_SCORE:
+        raw = "觀望"
     else:
-        return "暫不關注"
+        raw = "暫不關注"
+
+    out = {"bucket": raw, "raw_bucket": raw, "demote_reasons": [], "stop_pct": stop_pct}
+    if ctx is None or raw != "推薦":
+        return out
+
+    reasons = []
+    threshold = ctx.get("threshold", BASE_RECOMMEND_SCORE)
+    if total < threshold:
+        why = "、".join(ctx.get("threshold_reasons") or [])
+        reasons.append(f"未達今日推薦門檻 {threshold} 分（{why}）" if why else f"未達今日推薦門檻 {threshold} 分")
+    if (ctx.get("gate") or {}).get("status") == "red":
+        reasons.append("紅燈：今日不出推薦清單")
+    if stop_pct is not None and stop_pct > MAX_STOP_PCT:
+        reasons.append(f"波動過大：停損距離 {stop_pct:.2f}% > {MAX_STOP_PCT:g}%")
+
+    if reasons:
+        out["bucket"] = "觀望"
+        out["demote_reasons"] = reasons
+    return out
+
+
+def classify_stock(s: dict, ctx: "dict | None" = None) -> str:
+    """依 data_warning、total_score 與大盤環境（ctx），回傳這檔股票所屬分類
+
+    email（compose_email_html）與訊號日誌（signals_log）共用同一套判斷。
+    ctx 為 None 時只依分數（≥7 推薦、5–6 觀望、<5 暫不關注），與舊版相同。
+    """
+    return classify_stock_detail(s, ctx)["bucket"]
+
+
+def combine_gate(futures_gate: dict, us_indicators: list) -> dict:
+    """台指期夜盤 + 美股指標 → 最終燈號（取最差者），附上每個指標的明細"""
+    indicators = [futures_gate.get("indicator") or _gate_entry(
+        "台指期夜盤", futures_gate.get("status", "yellow"), "資料缺漏", "", missing=True)]
+    indicators += list(us_indicators or [])
+    worst = max(indicators, key=lambda x: GATE_RANK[x["status"]])["status"]
+    return {
+        "status": worst,
+        **GATE_STYLE[worst],
+        "action": GATE_ACTION[worst],
+        "indicators": indicators,
+        "futures": futures_gate,
+    }
+
+
+def compute_threshold(gate: dict, regime: dict) -> "tuple[int, list]":
+    """今日推薦門檻 = 基礎分 + 大盤環境 + 黃燈加分，上限 MAX_RECOMMEND_SCORE。
+
+    紅燈不調門檻（直接不出推薦清單，由 classify_stock_detail 處理）。
+    回傳 (門檻, 原因清單)；原因清單為空代表維持基礎門檻。
+    """
+    add, reasons = 0, []
+    for item in (regime or {}).get("adjustments", []):
+        add += item["add"]
+        reasons.append(item["reason"])
+    if gate.get("status") == "yellow":
+        add += REGIME_ADD_YELLOW
+        reasons.append(f"夜盤閘門黃燈 +{REGIME_ADD_YELLOW}")
+    threshold = min(BASE_RECOMMEND_SCORE + add, MAX_RECOMMEND_SCORE)
+    if BASE_RECOMMEND_SCORE + add > MAX_RECOMMEND_SCORE:
+        reasons.append(f"上限 {MAX_RECOMMEND_SCORE} 分")
+    return threshold, reasons
+
+
+def build_regime_context(futures_gate: dict, us_market: dict, regime: dict) -> dict:
+    """組合當天的閘門與門檻，供分類、報告、prompt、signals_log 共用"""
+    gate = combine_gate(futures_gate, get_us_gate_indicators(us_market))
+    threshold, reasons = compute_threshold(gate, regime)
+    return {
+        "gate": gate,
+        "regime": regime,
+        "threshold": threshold,
+        "threshold_reasons": reasons,
+    }
 
 
 # ══════════════════════════════════════════════════════════════
@@ -714,33 +1039,40 @@ def get_futures_gate() -> dict:
     """
     log.info("抓取台指期（TX）夜盤資料...")
 
-    start = (datetime.today() - timedelta(days=10)).strftime("%Y-%m-%d")
+    start = (_today() - timedelta(days=10)).strftime("%Y-%m-%d")
     df = finmind_get("TaiwanFuturesDaily", "TX", start)
 
+    rule = f"≤{TX_YELLOW_PTS}點 黃／≤{TX_RED_PTS}點 紅"
     result = {
         "status":      "green",
-        "emoji":       "🟢",
-        "label":       "綠燈",
-        "action":      "可依評分正常操作",
+        **GATE_STYLE["green"],
+        "action":      GATE_ACTION["green"],
         "night_close": None,
         "settlement":  None,
         "diff_pts":    None,
         "diff_pct":    None,
+        "night_date":  None,
         "error":       None,
+        "indicator":   None,
     }
 
-    if df.empty:
-        result["error"] = "無法取得台指期資料，閘門預設綠燈"
-        log.warning("⚠️  台指期（TX）無資料，夜盤閘門預設綠燈")
-        return result
-
-    required_cols = {"date", "contract_date", "close", "settlement_price", "trading_session"}
-    if not required_cols.issubset(df.columns):
-        result["error"] = f"台指期資料缺少欄位（現有：{list(df.columns)}），閘門預設綠燈"
+    def _missing(msg: str) -> dict:
+        # 抓不到資料不可預設綠燈：標示資料缺漏，以黃燈處理
+        result.update({"status": "yellow", **GATE_STYLE["yellow"], "action": GATE_ACTION["yellow"],
+                       "error": f"{msg}（資料缺漏，以黃燈處理）"})
+        result["indicator"] = _gate_entry("台指期夜盤", "yellow", f"資料缺漏（{msg}）", rule, missing=True)
         log.warning(f"⚠️  {result['error']}")
         return result
 
+    if df.empty:
+        return _missing("無法取得台指期資料")
+
+    required_cols = {"date", "contract_date", "close", "settlement_price", "trading_session"}
+    if not required_cols.issubset(df.columns):
+        return _missing(f"台指期資料缺少欄位（現有：{list(df.columns)}）")
+
     df = df.copy()
+    df["date"] = df["date"].astype(str)
     df["contract_date"] = df["contract_date"].astype(str)
     # 排除跨月價差合約，只保留單一到期月的合約
     df = df[~df["contract_date"].str.contains("/")]
@@ -751,9 +1083,7 @@ def get_futures_gate() -> dict:
     df_position = df[(df["trading_session"] == "position") & (df["settlement_price"] > 0)]
 
     if df_after.empty or df_position.empty:
-        result["error"] = "台指期收盤價或結算價無效，閘門預設綠燈"
-        log.warning(f"⚠️  {result['error']}")
-        return result
+        return _missing("台指期收盤價或結算價無效")
 
     # 夜盤：取近月合約（contract_date 最小）最新一筆有效收盤
     after_date = df_after["date"].max()
@@ -769,26 +1099,33 @@ def get_futures_gate() -> dict:
     settlement = float(position_row["settlement_price"])
 
     if not night_close or not settlement:
-        result["error"] = "台指期收盤價或結算價無效，閘門預設綠燈"
-        log.warning(f"⚠️  {result['error']}")
-        return result
+        return _missing("台指期收盤價或結算價無效")
 
     diff_pts    = round(night_close - settlement, 0)
     diff_pct    = round((night_close - settlement) / settlement * 100, 2)
 
-    result["night_close"] = night_close
-    result["settlement"]  = settlement
-    result["diff_pts"]    = diff_pts
-    result["diff_pct"]    = diff_pct
+    result["night_close"]     = night_close
+    result["settlement"]      = settlement
+    result["diff_pts"]        = diff_pts
+    result["diff_pct"]        = diff_pct
+    result["night_date"]      = str(after_date)
+    result["settlement_date"] = str(settlement_date)
 
-    if diff_pts <= -200:
-        result.update({"status": "red",    "emoji": "🔴", "label": "紅燈", "action": "今日暫停所有新進場"})
-    elif diff_pts <= -100:
-        result.update({"status": "yellow", "emoji": "🟡", "label": "黃燈", "action": "降低倉位"})
+    if diff_pts <= TX_RED_PTS:
+        status = "red"
+    elif diff_pts <= TX_YELLOW_PTS:
+        status = "yellow"
     else:
-        result.update({"status": "green",  "emoji": "🟢", "label": "綠燈", "action": "可依評分正常操作"})
+        status = "green"
+    result.update({"status": status, **GATE_STYLE[status], "action": GATE_ACTION[status]})
 
     sign = "+" if diff_pts >= 0 else ""
+    result["indicator"] = _gate_entry(
+        "台指期夜盤", status,
+        f"夜盤 {night_close:,.0f}（{after_date}）vs 結算 {settlement:,.0f}（{settlement_date}）"
+        f"：{sign}{diff_pts:.0f}點（{sign}{diff_pct:.2f}%）",
+        rule,
+    )
     log.info(
         f"  ✅ 台指期夜盤收盤：{night_close:.0f}  結算價：{settlement:.0f}"
         f"  差距：{sign}{diff_pts:.0f}點（{sign}{diff_pct:.2f}%）→ {result['emoji']} {result['label']}"
@@ -801,12 +1138,18 @@ def get_market_data() -> dict:
     FinMind 正確 data_id 為 'TAIEX'（非 Y9999）
     """
     log.info("抓取大盤指數資料...")
-    start = (datetime.today() - timedelta(days=14)).strftime("%Y-%m-%d")
+    start = (_today() - timedelta(days=MARKET_DATA_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
     df = finmind_get("TaiwanStockPrice", "TAIEX", start)
 
-    result = {"close": "N/A", "change": "N/A", "change_pct": "N/A", "date": "N/A"}
+    result = {"close": "N/A", "change": "N/A", "change_pct": "N/A", "date": "N/A",
+              "close_val": None, "ma20": None, "error": None}
     if df.empty:
-        log.warning("⚠️  大盤指數（TAIEX）無資料")
+        result["error"] = "大盤指數（TAIEX）無資料"
+        log.warning(f"⚠️  {result['error']}")
+        return result
+    if not {"date", "close", "spread"}.issubset(df.columns):
+        result["error"] = f"大盤指數資料缺少欄位（現有：{list(df.columns)}）"
+        log.warning(f"⚠️  {result['error']}")
         return result
 
     df = df.sort_values("date").reset_index(drop=True)
@@ -823,9 +1166,115 @@ def get_market_data() -> dict:
     result["close"]      = f"{close_val:,.2f}"
     result["change"]     = f"{'+' if spread_val >= 0 else ''}{spread_val:,.2f}"
     result["change_pct"] = f"{'+' if chg_p >= 0 else ''}{chg_p:.2f}%"
+    result["close_val"]  = close_val
 
-    log.info(f"  ✅ 大盤：{result['close']} 點  漲跌：{result['change']}（{result['change_pct']}）")
+    closes = df["close"].dropna()
+    if len(closes) >= TAIEX_MA_DAYS:
+        result["ma20"] = float(round(closes.tail(TAIEX_MA_DAYS).mean(), 2))
+    else:
+        log.warning(f"⚠️  大盤指數只有 {len(closes)} 筆，不足以計算 MA{TAIEX_MA_DAYS}")
+
+    log.info(
+        f"  ✅ 大盤：{result['close']} 點  漲跌：{result['change']}（{result['change_pct']}）"
+        f"  MA{TAIEX_MA_DAYS}={result['ma20']}"
+    )
     return result
+
+
+def get_foreign_market_flow() -> dict:
+    """外資（Foreign_Investor + Foreign_Dealer_Self）對大盤的每日買賣超金額與連續賣超天數
+
+    TaiwanStockTotalInstitutionalInvestors 的 buy/sell 單位是新台幣元。
+    """
+    log.info("抓取外資對大盤買賣超...")
+    start = (_today() - timedelta(days=FOREIGN_FLOW_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
+    df, err = _finmind_request("TaiwanStockTotalInstitutionalInvestors", "", start)
+
+    result = {"date": None, "net_today": None, "sell_streak": None, "series": [], "error": None}
+    if err:
+        result["error"] = f"外資買賣超 API 呼叫失敗：{err}"
+    elif df.empty:
+        result["error"] = "外資買賣超無資料"
+    elif not {"date", "name", "buy", "sell"}.issubset(df.columns):
+        result["error"] = f"外資買賣超資料缺少欄位（現有：{list(df.columns)}）"
+    if result["error"]:
+        log.warning(f"⚠️  {result['error']}")
+        return result
+
+    df = df[df["name"].isin(FOREIGN_INVESTOR_NAMES)].copy()
+    for col in ["buy", "sell"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    if df.empty or df[["buy", "sell"]].isna().any().any():
+        result["error"] = "外資買賣超資料缺漏（找不到外資列或買賣金額為空）"
+        log.warning(f"⚠️  {result['error']}")
+        return result
+
+    df["date"] = df["date"].astype(str)
+    daily = (df["buy"] - df["sell"]).groupby(df["date"]).sum().sort_index()
+
+    streak = 0
+    for net in reversed(daily.values):
+        if net < 0:
+            streak += 1
+        else:
+            break
+
+    result["date"]        = str(daily.index[-1])
+    result["net_today"]   = float(daily.iloc[-1])
+    result["sell_streak"] = streak
+    result["series"]      = [(d, round(v / 1e8, 2)) for d, v in daily.tail(5).items()]  # 億元
+    log.info(
+        f"  ✅ 外資對大盤（{result['date']}）：{result['net_today'] / 1e8:+,.2f} 億元，"
+        f"連續賣超 {streak} 日"
+    )
+    return result
+
+
+def get_market_regime(market_data: dict, foreign_flow: dict) -> dict:
+    """大盤環境 → 推薦門檻調整項目。資料缺漏時保守處理：該項門檻照樣 +1。"""
+    adjustments = []
+    notes = []
+
+    close_val, ma20 = market_data.get("close_val"), market_data.get("ma20")
+    if close_val is None or ma20 is None:
+        why = market_data.get("error") or f"MA{TAIEX_MA_DAYS} 資料不足"
+        adjustments.append({"key": "taiex_ma", "add": REGIME_ADD_BELOW_MA,
+                            "reason": f"加權指數 MA{TAIEX_MA_DAYS} 資料缺漏（{why}）+{REGIME_ADD_BELOW_MA}"})
+        notes.append(f"加權指數 vs MA{TAIEX_MA_DAYS}：資料缺漏")
+    else:
+        below = close_val < ma20
+        notes.append(
+            f"加權指數 {close_val:,.2f} {'<' if below else '≥'} MA{TAIEX_MA_DAYS} {ma20:,.2f}"
+        )
+        if below:
+            adjustments.append({"key": "taiex_ma", "add": REGIME_ADD_BELOW_MA,
+                                "reason": f"加權指數低於 MA{TAIEX_MA_DAYS} +{REGIME_ADD_BELOW_MA}"})
+
+    streak = foreign_flow.get("sell_streak")
+    if streak is None:
+        adjustments.append({"key": "foreign_sell", "add": REGIME_ADD_FOREIGN_SELL,
+                            "reason": f"外資買賣超資料缺漏（{foreign_flow.get('error')}）+{REGIME_ADD_FOREIGN_SELL}"})
+        notes.append("外資對大盤買賣超：資料缺漏")
+    else:
+        notes.append(
+            f"外資對大盤 {foreign_flow['net_today'] / 1e8:+,.2f} 億元（{foreign_flow['date']}），"
+            f"連續賣超 {streak} 日"
+        )
+        if streak >= FOREIGN_SELL_STREAK_DAYS:
+            adjustments.append({"key": "foreign_sell", "add": REGIME_ADD_FOREIGN_SELL,
+                                "reason": f"外資連續賣超 {streak} 日 +{REGIME_ADD_FOREIGN_SELL}"})
+
+    # 兩個資料來源的最新日期應該相同；對不上代表其中一邊延遲更新，比照資料
+    # 缺漏處理：門檻 +1，並保留警示
+    md, fd = market_data.get("date"), foreign_flow.get("date")
+    if md not in (None, "N/A") and fd and md != fd:
+        notes.append(f"⚠️ 資料日期不一致：加權指數 {md}、外資買賣超 {fd}")
+        adjustments.append({"key": "date_mismatch", "add": REGIME_ADD_DATE_MISMATCH,
+                            "reason": f"大盤資料日期不一致（加權指數 {md}／外資 {fd}）+{REGIME_ADD_DATE_MISMATCH}"})
+        log.warning(f"⚠️  大盤資料日期不一致：TAIEX {md} vs 外資 {fd}，門檻 +{REGIME_ADD_DATE_MISMATCH}")
+
+    return {"adjustments": adjustments, "notes": notes,
+            "market": market_data, "foreign_flow": foreign_flow}
 
 
 def get_stock_data(stock_id: str) -> "tuple[dict, pd.DataFrame]":
@@ -847,7 +1296,7 @@ def get_stock_data(stock_id: str) -> "tuple[dict, pd.DataFrame]":
     name  = STOCKS[stock_id]
     log.info(f"  抓取 {name}（{stock_id}）...")
 
-    today    = datetime.today()
+    today    = _today()
     start_90 = (today - timedelta(days=90)).strftime("%Y-%m-%d")   # 技術指標 / 法人用
     # 營收需要抓到去年同期：最新3個月 + 去年同3個月 ≈ 14個月，取 430 天保證涵蓋
     start_14m = (today - timedelta(days=430)).strftime("%Y-%m-%d")
@@ -1099,15 +1548,18 @@ def get_stock_data(stock_id: str) -> "tuple[dict, pd.DataFrame]":
 # Claude AI 分析
 # ══════════════════════════════════════════════════════════════
 
-def analyze_with_claude(stocks_data: list, market_data: dict) -> dict:
+def analyze_with_claude(stocks_data: list, market_data: dict,
+                        ctx: "dict | None" = None, use_llm: bool = True) -> dict:
     """
-    評分與交易價位在 Python 端直接計算（score_stock / calc_trade_levels），
-    Claude API 只負責產生文字說明（各面向理由、進場區間、風險提示等），
-    最後由本函式把系統計算的數值覆蓋回 Claude 的輸出，確保分數與價位精確。
+    評分、交易價位與分類（含大盤門檻、紅燈、波動上限）在 Python 端直接計算
+    （score_stock / calc_trade_levels / classify_stock_detail），Claude API
+    只負責產生文字說明（各面向理由、進場區間、風險提示等），最後由本函式把
+    系統計算的數值覆蓋回 Claude 的輸出，確保分數、分類與價位精確。
+
+    ctx：build_regime_context() 的結果（燈號、今日門檻）；None 代表只依分數分類。
+    use_llm=False 時不呼叫 Claude（回測／驗證用），文字欄位留空。
     """
     log.info("計算評分（Python）＋呼叫 Claude API 產生文字說明...")
-
-    client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
 
     # 準備給 Claude 的資料摘要（全部轉為 Python 原生型別）
     stocks_summary = []
@@ -1163,18 +1615,23 @@ def analyze_with_claude(stocks_data: list, market_data: dict) -> dict:
             float(s["close"]) if s.get("close") is not None else None,
             s.get("atr"),
         )
-        scored_by_id[sid] = {**score_stock(s), **levels}
+        sc = {**score_stock(s), **levels}
+        sc.update(classify_stock_detail({**s, **sc}, ctx))
+        scored_by_id[sid] = sc
 
     # 傳給 Claude 的評分結果（只含數字，供其撰寫理由時對照）——排除 data_warning
     # 股票，理由同上：避免彙總文字引用到可能失真的分數。
     scores_for_prompt = {
         sid: {k: v[k] for k in (
             "fundamental_score", "chip_score", "technical_score",
-            "total_score", "recommend",
+            "total_score", "bucket", "demote_reasons", "chip_notes",
         )}
         for sid, v in scored_by_id.items()
         if sid not in flagged_sids
     }
+
+    risk_facts = build_risk_facts(ctx, scored_by_id, stocks_data)
+    threshold  = (ctx or {}).get("threshold", BASE_RECOMMEND_SCORE)
 
     prompt = f"""你是台股量化分析師，請用繁體中文為以下股票撰寫分析說明，並呼叫 output_analysis 工具。
 
@@ -1188,15 +1645,20 @@ def analyze_with_claude(stocks_data: list, market_data: dict) -> dict:
 
 評分規則（僅供你撰寫理由時對照，實際分數以上方系統計算為準，滿分10分）：
 基本面（max 2）：avg_yoy_pct≥30%→2分，15-30%→1分，其他→0分
-籌碼面（max 4）：外資買超+1，外資連買≥3日再+1，投信買超+1，投信連買≥3日再+1
+籌碼面（max 4）：外資買超+1，外資連買≥3日再+1，投信買超+1，投信連買≥3日再+1；投信買超>0且外資賣超張數≥投信買超張數×{FOREIGN_DUMP_MULTIPLE}時−{FOREIGN_DUMP_PENALTY}（最低0，原因見 chip_notes）
 技術面（max 4）：above_ma5=true+1，above_ma20=true+1，kd_cross=true且K<80再+1，volume_ratio>1.2且price_chg_pct>0再+1
+
+【今日風控結果 —— 已由系統計算完成（燈號、推薦門檻、被降級個股與原因），不可更改、不可自行增減】
+{json.dumps(risk_facts, ensure_ascii=False, indent=2)}
 
 【輸出要求】
 - 逐檔輸出 fundamental_reason / chip_reason / technical_reason，內容需與系統給的分數一致，各限50字以內
 - entry_range：建議進場區間（參考昨收價，例如「95.0–97.5」）
-- summary限30字以內；watch_conditions：未達推薦門檻（總分<7）時要觀察的改善條件
+- summary限30字以內；watch_conditions：未列入推薦時要觀察的改善條件（今日推薦門檻 {threshold} 分；若有 demote_reasons 須據實說明）
 - 停損停利價位由系統以 ATR 計算，你不需輸出
-- market_summary/risk_warning/overall_foreign_trend各限60字以內"""
+- risk_warning：只能依「今日風控結果」改寫成通順的文字（燈號與觸發指標、今日門檻與原因、被降級的個股與原因），不得加入上面沒有的判斷、新聞或預測
+- 所有文字不得對個股或大盤做方向性預測（例如「逆勢可期」「可望上漲」）
+- market_summary/risk_warning/overall_foreign_trend各限60字以內（risk_warning 可放寬至 150 字）"""
 
     # ── 使用 Tool Use 確保輸出合法 JSON（最可靠方式）────────────────
     tools = [
@@ -1230,13 +1692,22 @@ def analyze_with_claude(stocks_data: list, market_data: dict) -> dict:
                     },
                     "market_summary":        {"type": "string", "description": "大盤概況說明（50字內）"},
                     "overall_foreign_trend": {"type": "string", "description": "外資在這12檔的整體動向"},
-                    "risk_warning":          {"type": "string", "description": "今日操作風險提示（100字內）"},
+                    "risk_warning":          {"type": "string", "description": "今日操作風險提示（150字內），只能依系統提供的今日風控結果撰寫"},
                 },
                 "required": ["stocks", "market_summary", "overall_foreign_trend", "risk_warning"],
             },
         }
     ]
 
+    if not use_llm:
+        log.info("  --no-llm：略過 Claude API，文字欄位留空")
+        return _merge_final_stocks(
+            {"stocks": [], "market_summary": "", "overall_foreign_trend": "",
+             "risk_warning": "（--no-llm 模式，未產生文字）"},
+            stocks_data, scored_by_id, ctx, risk_facts,
+        )
+
+    client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
     message = client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=8000,          # ← 從 4096 提升到 8000，防止 8 檔股票詳細分析被截斷
@@ -1258,6 +1729,14 @@ def analyze_with_claude(stocks_data: list, market_data: dict) -> dict:
     if result is None:
         raise ValueError("Claude 未回傳 output_analysis 工具呼叫結果")
 
+    return _merge_final_stocks(result, stocks_data, scored_by_id, ctx, risk_facts)
+
+
+def _merge_final_stocks(result: dict, stocks_data: list, scored_by_id: dict,
+                        ctx: "dict | None", risk_facts: dict) -> dict:
+    """把 Python 計算的分數、分類、價位併回 Claude 的文字輸出"""
+    threshold = (ctx or {}).get("threshold", BASE_RECOMMEND_SCORE)
+
     # ── 以 stock_id 對回 Claude 產生的文字說明 ──────────────────
     narr_by_id = {str(s.get("stock_id", "")): s for s in result.get("stocks", [])}
 
@@ -1271,17 +1750,30 @@ def analyze_with_claude(stocks_data: list, market_data: dict) -> dict:
         sid  = str(s["stock_id"])
         sc   = scored_by_id.get(sid, {})
         narr = narr_by_id.get(sid, {})
+        # 籌碼扣分原因由系統直接附在說明後面，不依賴 Claude 有沒有寫到
+        chip_reason = narr.get("chip_reason", "")
+        chip_notes  = sc.get("chip_notes") or []
+        if chip_notes:
+            chip_reason = (chip_reason + "　" if chip_reason else "") + "【扣分】" + "；".join(chip_notes)
         final_stocks.append({
             "stock_id":           sid,
             "name":               STOCKS.get(sid, s.get("name", "")),
             "fundamental_score":  sc.get("fundamental_score", 0),
             "fundamental_reason": narr.get("fundamental_reason", ""),
             "chip_score":         sc.get("chip_score", 0),
-            "chip_reason":        narr.get("chip_reason", ""),
+            "chip_reason":        chip_reason,
+            "chip_notes":         chip_notes,
             "technical_score":    sc.get("technical_score", 0),
             "technical_reason":   narr.get("technical_reason", ""),
             "total_score":        sc.get("total_score", 0),
-            "recommend":          sc.get("recommend", False),
+            # recommend 以最終分類為準（已套用大盤門檻、紅燈、波動上限）
+            "recommend":          sc.get("bucket") == "推薦",
+            "bucket":             sc.get("bucket"),
+            "raw_bucket":         sc.get("raw_bucket"),
+            "demote_reasons":     sc.get("demote_reasons") or [],
+            "stop_pct":           sc.get("stop_pct"),
+            "threshold_used":     threshold,
+            "foreign_dump_penalty": sc.get("foreign_dump_penalty", 0),
             "close":              float(s["close"]) if s.get("close") is not None else None,
             "entry_range":        narr.get("entry_range", "N/A"),
             "stop_loss":          sc.get("stop_loss", "N/A"),
@@ -1296,17 +1788,55 @@ def analyze_with_claude(stocks_data: list, market_data: dict) -> dict:
         })
 
     result["stocks"] = final_stocks
+    result["risk_facts"] = risk_facts
 
-    log.info(f"  評分完成（Python 計算）：{len(final_stocks)} 檔")
+    log.info(f"  評分完成（Python 計算）：{len(final_stocks)} 檔，今日推薦門檻 {threshold} 分")
     for s in final_stocks:
         log.info(
             f"    {s['name']}({s['stock_id']}): "
             f"總={s['total_score']} 基={s['fundamental_score']} "
             f"籌={s['chip_score']} 技={s['technical_score']} "
-            f"推薦={s['recommend']} 停損={s['stop_loss']} 目標={s['target1']}/{s['target2']} "
-            f"[{s['level_basis']}]"
+            f"分類={s['bucket']}（原={s['raw_bucket']}） 停損={s['stop_loss']}（{s['stop_pct']}%） "
+            f"目標={s['target1']}/{s['target2']} [{s['level_basis']}]"
+            + (f" 降級：{'；'.join(s['demote_reasons'])}" if s["demote_reasons"] else "")
+            + (f" 扣分：{'；'.join(s['chip_notes'])}" if s["chip_notes"] else "")
         )
     return result
+
+
+def build_risk_facts(ctx: "dict | None", scored_by_id: dict, stocks_data: list) -> dict:
+    """風險提示的事實清單：燈號（含各指標）、今日門檻與原因、被降級的個股與原因。
+
+    全部由 Python 計算，傳給 Claude 改寫成文字，也直接顯示在報告上供對照。
+    """
+    names = {str(s["stock_id"]): s.get("name", "") for s in stocks_data}
+    ctx = ctx or {}
+    gate = ctx.get("gate") or {}
+    demoted = [
+        {"stock": f"{names.get(sid, '')}({sid})", "total_score": v.get("total_score"),
+         "stop_pct": v.get("stop_pct"), "reasons": v.get("demote_reasons")}
+        for sid, v in scored_by_id.items() if v.get("demote_reasons")
+    ]
+    penalized = [
+        {"stock": f"{names.get(sid, '')}({sid})", "note": "；".join(v.get("chip_notes"))}
+        for sid, v in scored_by_id.items() if v.get("chip_notes")
+    ]
+    return {
+        "gate": {
+            "final": gate.get("label", "未計算"),
+            "action": gate.get("action", ""),
+            "indicators": [
+                {"name": i["name"], "value": i["value"], "light": i["label"],
+                 "data_missing": i.get("missing", False)}
+                for i in gate.get("indicators", [])
+            ],
+        },
+        "threshold": ctx.get("threshold", BASE_RECOMMEND_SCORE),
+        "threshold_reasons": ctx.get("threshold_reasons") or [],
+        "regime_notes": (ctx.get("regime") or {}).get("notes", []),
+        "demoted_stocks": demoted,
+        "foreign_dump_penalties": penalized,
+    }
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1347,6 +1877,10 @@ SIGNALS_LOG_COLUMNS = [
     "period_high", "period_low",
     "hit_target1", "hit_target2", "hit_stop", "ambiguous",
     "backfill_complete",
+    # 大盤門檻與降級（2026-11 新增；舊紀錄為空）
+    # raw_bucket：只依分數（≥7 推薦、5–6 觀望）、未經門檻與降級調整的分類，
+    # 跟舊紀錄的 bucket 同一口徑，方便新舊比較
+    "threshold_used", "demote_reason", "raw_bucket",
 ]
 
 # 上面「回填」那一段的欄位名稱，讀 CSV 回來後要轉成 object dtype（見
@@ -1456,7 +1990,7 @@ def build_signal_row(
         "fundamental_score": fs.get("fundamental_score"),
         "chip_score": fs.get("chip_score"),
         "technical_score": fs.get("technical_score"),
-        "bucket": classify_stock(fs),
+        "bucket": fs.get("bucket") or classify_stock(fs),
         "recommend": fs.get("recommend"),
 
         "close": close,
@@ -1508,6 +2042,10 @@ def build_signal_row(
         "hit_stop": None,
         "ambiguous": None,
         "backfill_complete": False,
+
+        "threshold_used": fs.get("threshold_used"),
+        "demote_reason": "；".join(fs.get("demote_reasons") or []),
+        "raw_bucket": fs.get("raw_bucket") or classify_stock(fs),
     }
 
 
@@ -1745,7 +2283,8 @@ def write_signals_log(
     「警示」），方便事後統計時自行排除。
     """
     if generated_at is None:
-        generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # 台北時間並附上時區標記，backtest.run_parity 依此換算回實盤的 UTC 日期
+        generated_at = now_tpe().strftime("%Y-%m-%d %H:%M:%S") + "+08:00"
     code_version = get_code_version()
 
     raw_by_id = {s["stock_id"]: s for s in stocks_data}
@@ -1806,35 +2345,46 @@ def write_signals_log(
 # ══════════════════════════════════════════════════════════════
 
 def _build_gate_banner(gate: dict) -> str:
-    """組裝台指期夜盤閘門大型橫幅（顯示於報告最頂端）"""
-    status = gate.get("status", "green")
-    bg_map = {"red": "#c0392b", "yellow": "#d68910", "green": "#1e8449"}
-    bg     = bg_map.get(status, "#1e8449")
+    """組裝夜盤閘門大型橫幅（顯示於報告最頂端）
 
-    if gate.get("error"):
-        detail = f'<span style="font-size:13px;opacity:0.8;">（{gate["error"]}）</span>'
-    else:
-        nc   = gate.get("night_close", 0)
-        st   = gate.get("settlement",  0)
-        pts  = gate.get("diff_pts",    0)
-        pct  = gate.get("diff_pct",    0)
-        sign = "+" if pts >= 0 else ""
-        detail = (
-            f'<span style="font-size:14px;opacity:0.9;">'
-            f'台指期夜盤收盤：<strong>{nc:,.0f}</strong> ｜ '
-            f'結算價：<strong>{st:,.0f}</strong> ｜ '
-            f'差距：<strong>{sign}{pts:.0f}點（{sign}{pct:.2f}%）</strong>'
-            f'</span>'
-        )
+    gate 為 combine_gate() 的結果：最終燈號取各指標中最差者，橫幅下方逐列
+    列出每個指標的數值與各自燈號，看得出是哪個指標觸發。舊格式（只有台指期
+    的 get_futures_gate() 結果）也能顯示。
+    """
+    status = gate.get("status", "yellow")
+    bg_map = {"red": "#c0392b", "yellow": "#d68910", "green": "#1e8449"}
+    bg     = bg_map.get(status, "#d68910")
+
+    indicators = gate.get("indicators")
+    if indicators is None:
+        indicators = [gate["indicator"]] if gate.get("indicator") else [
+            _gate_entry("台指期夜盤", status, gate.get("error") or "未取得資料", "", missing=True)]
+
+    rows = "".join(
+        f'<tr style="background:{"rgba(255,255,255,0.18)" if i["status"] == status and status != "green" else "transparent"};">'
+        f'<td style="padding:4px 10px;text-align:left;">{i["name"]}</td>'
+        f'<td style="padding:4px 10px;text-align:left;">{i["value"]}</td>'
+        f'<td style="padding:4px 10px;text-align:left;opacity:0.8;font-size:12px;">{i.get("rule","")}</td>'
+        f'<td style="padding:4px 10px;white-space:nowrap;">{i["emoji"]} {i["label"]}</td>'
+        f'</tr>'
+        for i in indicators
+    )
 
     return f"""
-  <!-- 台指期夜盤閘門 -->
+  <!-- 夜盤閘門（多指標，取最差者） -->
   <div style="background:{bg};padding:22px 30px;text-align:center;">
-    <div style="font-size:52px;line-height:1.1;">{gate.get("emoji","🟢")}</div>
+    <div style="font-size:52px;line-height:1.1;">{gate.get("emoji","🟡")}</div>
     <div style="font-size:26px;font-weight:bold;color:white;margin:6px 0;">
-      台指期夜盤閘門：{gate.get("label","綠燈")} — {gate.get("action","")}
+      夜盤閘門：{gate.get("label","黃燈")} — {gate.get("action","")}
     </div>
-    <div style="margin-top:6px;color:rgba(255,255,255,0.85);">{detail}</div>
+    <table style="margin:10px auto 0;color:white;font-size:13px;border-collapse:collapse;">
+      <tr style="opacity:0.75;font-size:12px;">
+        <td style="padding:2px 10px;text-align:left;">指標</td><td style="padding:2px 10px;text-align:left;">數值</td>
+        <td style="padding:2px 10px;text-align:left;">規則</td><td style="padding:2px 10px;">燈號</td>
+      </tr>
+      {rows}
+    </table>
+    <div style="margin-top:6px;color:rgba(255,255,255,0.8);font-size:12px;">最終燈號取各指標中最差者；資料缺漏以黃燈處理</div>
   </div>
 """
 
@@ -1851,8 +2401,10 @@ def _build_us_section(us_market: dict, news_analysis: dict) -> str:
         info = us_market.get(key, {})
         label   = info.get("label", key)
         chg_str = info.get("chg_str", "N/A")
-        chg_p   = info.get("chg_pct", 0.0)
-        color   = GREEN if chg_p > 0 else (RED if chg_p < 0 else GRAY)
+        chg_p   = info.get("chg_pct")
+        color   = GRAY if chg_p is None else (GREEN if chg_p > 0 else (RED if chg_p < 0 else GRAY))
+        if info.get("error"):
+            chg_str = "資料缺漏"
         us_cells += (
             f'<div style="padding:8px;background:white;border-radius:5px;">'
             f'<span style="font-size:12px;color:#666;">{label}</span><br>'
@@ -1877,13 +2429,20 @@ def _build_us_section(us_market: dict, news_analysis: dict) -> str:
             f'border-radius:10px;font-size:11px;margin-left:8px;">'
             f'{item.get("impact","中性")}</span>'
         )
+        old_badge = (
+            '<span style="background:#999;color:white;padding:2px 8px;'
+            'border-radius:10px;font-size:11px;margin-left:6px;">舊聞</span>'
+            if item.get("is_old_news") else ""
+        )
+        date_str = item.get("event_date") or "日期不明"
         news_items_html += (
             f'<div style="margin:10px 0;padding:12px;background:#f9f9f9;'
             f'border-left:3px solid {ic};border-radius:4px;">'
             f'<p style="margin:0 0 4px;font-size:13px;font-weight:bold;">'
-            f'📌 {item.get("title","")}{badge}</p>'
+            f'📌 <span style="color:#666;font-weight:normal;">[{date_str}]</span> '
+            f'{item.get("title","")}{badge}{old_badge}</p>'
             f'<p style="margin:0 0 4px;font-size:13px;color:#444;">{item.get("summary","")}</p>'
-            f'<p style="margin:0;font-size:12px;color:#666;">影響標的：{item.get("affected_stocks","")}</p>'
+            f'<p style="margin:0;font-size:12px;color:#666;">相關標的：{item.get("affected_stocks","")}</p>'
             f'</div>'
         )
     if not news_items_html:
@@ -1904,7 +2463,9 @@ def _build_us_section(us_market: dict, news_analysis: dict) -> str:
         '<div class="section">'
         '<h2 class="blue">零、🌙 昨夜美股與重大消息</h2>'
         f'{us_block}'
-        '<p style="font-weight:bold;font-size:14px;margin:0 0 6px;">📰 重大消息與影響</p>'
+        '<p style="font-weight:bold;font-size:14px;margin:0 0 2px;">📰 重大消息（參考資訊）</p>'
+        '<p style="font-size:12px;color:#888;margin:0 0 6px;">新聞僅供參考，不影響評分與分類；'
+        '標示「舊聞」者非前一晚發生或首次揭露。</p>'
         f'{news_items_html}'
         f'{alert_block}'
         '</div>'
@@ -1919,8 +2480,14 @@ def compose_email_html(
     us_market: dict = None,
     news_analysis: dict = None,
     futures_gate: dict = None,
+    ctx: dict = None,
+    sent_date: "datetime | None" = None,
 ) -> str:
-    """組合 HTML 格式的完整 Email 內容"""
+    """組合 HTML 格式的完整 Email 內容
+
+    ctx 為 build_regime_context() 的結果（最終燈號、今日推薦門檻與原因）；
+    沒傳時只用 futures_gate 顯示閘門、門檻維持基礎分。
+    """
 
     if market_data is None:
         market_data = {}
@@ -1929,7 +2496,13 @@ def compose_email_html(
     if news_analysis is None:
         news_analysis = {}
     if futures_gate is None:
-        futures_gate = {"status": "green", "emoji": "🟢", "label": "綠燈", "action": "可依評分正常操作", "error": "未取得資料"}
+        futures_gate = {"status": "yellow", **GATE_STYLE["yellow"], "action": GATE_ACTION["yellow"],
+                        "error": "未取得資料（資料缺漏，以黃燈處理）"}
+    ctx = ctx or {}
+    gate = ctx.get("gate") or futures_gate
+    threshold = ctx.get("threshold", BASE_RECOMMEND_SCORE)
+    threshold_reasons = ctx.get("threshold_reasons") or []
+    regime_notes = (ctx.get("regime") or {}).get("notes", [])
 
     raw_by_id = {s["stock_id"]: s for s in stocks_data}
     all_stocks = analysis.get("stocks", [])
@@ -1937,10 +2510,11 @@ def compose_email_html(
     # 有 data_warning（價格資料疑似失真）的股票，不參與進場清單／觀望／暫不
     # 關注的分類，也不顯示分數與進場區間、停損停利——這些數字很可能是用失真
     # 資料算出來的，混在正常清單裡反而誤導。獨立另闢一區只顯示警示文字。
-    # 分類邏輯統一由 classify_stock() 判斷（signals_log 也用同一個函式）。
+    # 分類在 analyze_with_claude 已經依今日門檻算好（s["bucket"]，signals_log
+    # 用同一個值）；舊資料沒有這個欄位時才退回 classify_stock()。
     buckets = {"警示": [], "推薦": [], "觀望": [], "暫不關注": []}
     for s in all_stocks:
-        buckets[classify_stock(s)].append(s)
+        buckets[s.get("bucket") or classify_stock(s)].append(s)
     flagged     = buckets["警示"]
     recommended = buckets["推薦"]
     watchlist   = buckets["觀望"]
@@ -2083,6 +2657,18 @@ def compose_email_html(
           </div>
             """
 
+        if s.get("demote_reasons"):
+            reasons_html = "".join(f"<li>{r}</li>" for r in s["demote_reasons"])
+            stop_pct = s.get("stop_pct")
+            stop_html = f"停損距離 {stop_pct:.2f}%（上限 {MAX_STOP_PCT:g}%）" if stop_pct is not None else "停損距離 N/A"
+            card += f"""
+          <div style="background:#fff8e1;border-left:4px solid {YELLOW};padding:8px 12px;
+                      border-radius:4px;margin-top:8px;font-size:12px;color:#7a5200;">
+            ⬇️ <strong>分數達 {BASE_RECOMMEND_SCORE} 分，但今日改列觀望</strong>（{stop_html}）：
+            <ul style="margin:4px 0 0 18px;padding:0;">{reasons_html}</ul>
+          </div>
+            """
+
         if not s.get("recommend") and s.get("watch_conditions"):
             card += f"""
           <p style="margin:6px 0 0;font-size:12px;color:#888;">
@@ -2095,7 +2681,9 @@ def compose_email_html(
 
     # ── 組裝完整 HTML ──
     rec_section = "".join(stock_card(s, GREEN) for s in recommended) or (
-        "<p style='color:#aaa;'>今日無符合條件（≥7分）的推薦標的</p>"
+        f"<p style='color:#aaa;'>今日無符合條件（≥{threshold}分）的推薦標的</p>"
+        if gate.get("status") != "red" else
+        "<p style='color:#c0392b;font-weight:bold;'>🔴 紅燈：今日不出推薦清單（達標個股改列觀望）</p>"
     )
     watch_section = "".join(stock_card(s, YELLOW, show_trade=False) for s in watchlist) or (
         "<p style='color:#aaa;'>無觀望標的</p>"
@@ -2170,6 +2758,48 @@ def compose_email_html(
         if weak_rows else "<p style='color:#aaa;'>無</p>"
     )
 
+    # ── 今日推薦門檻（大盤概況段落）──
+    reasons_txt = "、".join(threshold_reasons) if threshold_reasons else "大盤環境正常，維持基礎門檻"
+    notes_html = "".join(f"<li>{n}</li>" for n in regime_notes)
+    threshold_html = f"""
+    <div style="background:#eef4fb;border-left:4px solid {BLUE};padding:10px 14px;
+                border-radius:4px;font-size:14px;margin:8px 0;">
+      🎚️ <strong>今日推薦門檻：{threshold} 分</strong>
+      （基礎 {BASE_RECOMMEND_SCORE} 分，上限 {MAX_RECOMMEND_SCORE} 分）｜原因：{reasons_txt}
+      {"<br>🔴 <strong>紅燈：今日不出推薦清單</strong>" if gate.get("status") == "red" else ""}
+      {f'<ul style="margin:6px 0 0 18px;padding:0;font-size:13px;color:#555;">{notes_html}</ul>' if notes_html else ""}
+    </div>"""
+
+    watch_hi = threshold - 1
+    watch_range = f"{WATCH_MIN_SCORE}–{watch_hi} 分" if watch_hi > WATCH_MIN_SCORE else f"{WATCH_MIN_SCORE} 分"
+    watch_title = f"評分 {watch_range}"
+    if any(s.get("demote_reasons") for s in watchlist):
+        watch_title += "，含被降級個股"
+
+    # ── 風險提示的系統計算依據（與送給 Claude 的事實相同，直接列出供對照）──
+    rf = analysis.get("risk_facts") or {}
+    fact_lines = []
+    if rf:
+        g = rf.get("gate", {})
+        ind = "；".join(f"{i['name']} {i['value']} → {i['light']}" for i in g.get("indicators", []))
+        fact_lines.append(f"夜盤閘門：{g.get('final','')}（{ind}）")
+        fact_lines.append(
+            f"今日推薦門檻：{rf.get('threshold')} 分"
+            + (f"（{'、'.join(rf.get('threshold_reasons'))}）" if rf.get("threshold_reasons") else "")
+        )
+        for d in rf.get("demoted_stocks", []):
+            fact_lines.append(f"降級：{d['stock']} {d['total_score']} 分 → 觀望（{'；'.join(d['reasons'])}）")
+        for d in rf.get("foreign_dump_penalties", []):
+            fact_lines.append(f"籌碼扣分：{d['stock']} {d['note']}")
+    risk_facts_html = (
+        '<p style="font-size:12px;color:#888;margin:10px 0 4px;">系統計算依據：</p>'
+        '<ul style="margin:0 0 0 18px;padding:0;font-size:12px;color:#555;">'
+        + "".join(f"<li>{x}</li>" for x in fact_lines) + "</ul>"
+    ) if fact_lines else ""
+
+    # 標頭：資料日 + 台北時間的寄出日（例：資料日期：2026/11/04（11/5 開盤前寄出））
+    sent_html = f"（{sent_date.month}/{sent_date.day} 開盤前寄出）" if sent_date else ""
+
     html = f"""
 <!DOCTYPE html>
 <html lang="zh-TW">
@@ -2200,11 +2830,11 @@ def compose_email_html(
   <!-- Header -->
   <div class="header">
     <h1>📊 台股 AI 每日分析報告</h1>
-    <p>報告日期：{today_str} ｜ 分析模型：Claude AI ｜ 資料來源：FinMind</p>
+    <p>資料日期：{today_str}{sent_html} ｜ 分析模型：Claude AI ｜ 資料來源：FinMind</p>
   </div>
 
   <!-- 台指期夜盤閘門 -->
-  {_build_gate_banner(futures_gate)}
+  {_build_gate_banner(gate)}
 
   <!-- 零、昨夜美股與重大消息 -->
   {_build_us_section(us_market, news_analysis)}
@@ -2217,6 +2847,7 @@ def compose_email_html(
       &nbsp;漲跌：<strong>{market_data.get('change','N/A')}</strong>
       （<strong>{market_data.get('change_pct','N/A')}</strong>）
     </p>
+    {threshold_html}
     <p style="font-size:14px;color:#555;">{analysis.get('market_summary','')}</p>
   </div>
 
@@ -2224,20 +2855,20 @@ def compose_email_html(
 
   <!-- 二、推薦進場清單 -->
   <div class="section">
-    <h2 class="green">二、✅ 推薦進場清單（評分 ≥ 7 分，共 {len(recommended)} 檔）</h2>
+    <h2 class="green">二、✅ 推薦進場清單（評分 ≥ {threshold} 分，共 {len(recommended)} 檔）</h2>
     {rec_section}
   </div>
 
   <!-- 三、觀望清單 -->
   <div class="section">
-    <h2 class="yellow">三、👀 觀望清單（評分 5–6 分，共 {len(watchlist)} 檔）</h2>
+    <h2 class="yellow">三、👀 觀望清單（{watch_title}，共 {len(watchlist)} 檔）</h2>
     {watch_section}
   </div>
 
   <!-- 評分偏低 -->
   <div class="section">
     <h2 style="font-size:16px;margin:0 0 14px;color:#999;border-left:4px solid #ccc;padding-left:10px;">
-      暫不關注（評分 &lt; 5 分）
+      暫不關注（評分 &lt; {WATCH_MIN_SCORE} 分）
     </h2>
     {weak_section}
   </div>
@@ -2250,12 +2881,13 @@ def compose_email_html(
                 border-radius:4px;font-size:14px;">
       {analysis.get('risk_warning','')}
     </div>
+    {risk_facts_html}
   </div>
 
   <!-- Footer -->
   <div class="footer">
     ⚠️ 本報告由 AI 自動生成，僅供參考，不構成投資建議。投資有風險，請自行判斷。<br>
-    產生時間：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ｜
+    產生時間：{now_tpe().strftime('%Y-%m-%d %H:%M:%S')} (UTC+8) ｜
     分析引擎：Anthropic Claude Sonnet
   </div>
 
@@ -2285,7 +2917,7 @@ def send_email(subject: str, html_body: str) -> None:
 def send_error_email(error_details: str) -> None:
     """當程式發生嚴重錯誤時，寄送錯誤通知"""
     try:
-        today_str = datetime.now().strftime("%Y/%m/%d %H:%M")
+        today_str = now_tpe().strftime("%Y/%m/%d %H:%M") + " (UTC+8)"
         subject   = f"❌ 台股 AI 分析系統發生錯誤 — {today_str}"
         body = f"""
         <html><body style="font-family:Arial;padding:20px;">
@@ -2306,39 +2938,92 @@ def send_error_email(error_details: str) -> None:
 # 主程式
 # ══════════════════════════════════════════════════════════════
 
-def main():
-    today      = datetime.now()
+def parse_args(argv=None):
+    ap = argparse.ArgumentParser(description="台股 AI 每日分析")
+    ap.add_argument("--date", help="指定資料日期 YYYY-MM-DD（重現該日收盤後的報告）；預設為即時模式")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="不寄信、不寫 signals_log；HTML 與分類結果寫到 --out 目錄")
+    ap.add_argument("--no-llm", action="store_true",
+                    help="不呼叫 Claude（新聞與文字說明留空），分數與分類不受影響")
+    ap.add_argument("--out", default=os.path.join(_DIR, "backtest_output", "dry_run"),
+                    help="--dry-run 的輸出目錄")
+    args = ap.parse_args(argv)
+    if args.date:
+        datetime.strptime(args.date, "%Y-%m-%d")  # 格式錯誤直接報錯
+        if not args.dry_run:
+            ap.error("--date 只能搭配 --dry-run 使用（避免把歷史日期的報告寄出或寫進 signals_log）")
+    return args
+
+
+def _write_dry_run(out_dir: str, tag: str, html_body: str, analysis: dict, ctx: dict) -> None:
+    os.makedirs(out_dir, exist_ok=True)
+    with open(os.path.join(out_dir, f"report_{tag}.html"), "w", encoding="utf-8") as f:
+        f.write(html_body)
+    rows = [{k: fs.get(k) for k in (
+        "stock_id", "name", "total_score", "fundamental_score", "chip_score", "technical_score",
+        "foreign_dump_penalty", "raw_bucket", "bucket", "stop_pct", "threshold_used",
+    )} | {"demote_reason": "；".join(fs.get("demote_reasons") or []),
+          "chip_notes": "；".join(fs.get("chip_notes") or [])}
+        for fs in analysis.get("stocks", [])]
+    pd.DataFrame(rows).to_csv(os.path.join(out_dir, f"classify_{tag}.csv"), index=False)
+    with open(os.path.join(out_dir, f"context_{tag}.json"), "w", encoding="utf-8") as f:
+        json.dump({k: v for k, v in ctx.items()}, f, ensure_ascii=False, indent=2, default=str)
+    log.info(f"  📝 dry-run 輸出：{out_dir}（report_/classify_/context_{tag}）")
+
+
+def main(argv=None):
+    global AS_OF
+    args = parse_args(argv)
+    AS_OF = args.date
+
+    today      = _today() if AS_OF else datetime.now()
     today_str  = today.strftime("%Y/%m/%d")
     log.info(f"{'='*60}")
-    log.info(f"台股 AI 每日分析系統啟動 — {today_str}")
+    log.info(f"台股 AI 每日分析系統啟動 — {today_str}"
+             + (f"（指定資料日 {AS_OF}）" if AS_OF else "")
+             + ("［dry-run］" if args.dry_run else "") + ("［no-llm］" if args.no_llm else ""))
     log.info(f"{'='*60}")
 
     # ── 檢查必要設定 ───────────────────────────────────────────
-    missing = [
-        k for k, v in {
-            "FINMIND_TOKEN":   FINMIND_TOKEN,
-            "ANTHROPIC_KEY":   ANTHROPIC_KEY,
+    required = {"FINMIND_TOKEN": FINMIND_TOKEN}
+    if not args.no_llm:
+        required["ANTHROPIC_KEY"] = ANTHROPIC_KEY
+    if not args.dry_run:
+        required.update({
             "GMAIL_USER":      GMAIL_USER,
             "GMAIL_PASSWORD":  GMAIL_PASSWORD,
             "RECIPIENT_EMAIL": RECIPIENT_EMAIL,
-        }.items() if not v
-    ]
+        })
+    missing = [k for k, v in required.items() if not v]
     if missing:
         err = f"缺少必要環境變數：{missing}"
         log.error(err)
-        send_error_email(err)
+        if not args.dry_run:
+            send_error_email(err)
         sys.exit(1)
 
     try:
-        # ── Step 0: 台指期夜盤閘門 ──────────────────────────────
+        # ── Step 0: 夜盤閘門（台指期 + 費半 + NVIDIA）──────────
         futures_gate = get_futures_gate()
+        us_market    = get_us_market_data(AS_OF)
 
-        # ── Step 1: 美股數據 + 新聞分析 ─────────────────────────
-        us_market     = get_us_market_data()
-        news_analysis = get_us_news_analysis(us_market)
+        # ── Step 1: 大盤環境（加權指數 MA20、外資對大盤買賣超）──
+        market_data  = get_market_data()
+        foreign_flow = get_foreign_market_flow()
+        regime       = get_market_regime(market_data, foreign_flow)
+        ctx          = build_regime_context(futures_gate, us_market, regime)
+        log.info(
+            f"  🎚️ 最終燈號 {ctx['gate']['emoji']} {ctx['gate']['label']}"
+            f"（{'；'.join(i['name'] + '=' + i['label'] for i in ctx['gate']['indicators'])}）"
+            f"  今日推薦門檻 {ctx['threshold']} 分"
+            + (f"（{'、'.join(ctx['threshold_reasons'])}）" if ctx["threshold_reasons"] else "")
+        )
 
-        # ── Step 2: 大盤資料 ────────────────────────────────────
-        market_data = get_market_data()
+        # ── Step 2: 新聞（參考資訊，不進入評分）────────────────
+        if args.no_llm:
+            news_analysis = {"news_items": [], "key_alert": ""}
+        else:
+            news_analysis = get_us_news_analysis(us_market, ref_date=AS_OF)
 
         # ── Step 3: 逐一抓取股票資料 ────────────────────────────
         log.info(f"開始抓取 {len(STOCKS)} 檔股票資料...")
@@ -2359,17 +3044,25 @@ def main():
                 })
                 price_cache[stock_id] = pd.DataFrame()
 
-        # ── Step 4: Claude AI 分析 ───────────────────────────────
-        analysis = analyze_with_claude(stocks_data, market_data)
+        # ── Step 4: 評分、分類（Python）＋ Claude 文字說明 ───────
+        analysis = analyze_with_claude(stocks_data, market_data, ctx=ctx, use_llm=not args.no_llm)
 
         # ── Step 5: 組合並寄送 Email ────────────────────────────
-        gate_emoji = futures_gate.get("emoji", "📊")
+        gate_emoji = ctx["gate"].get("emoji", "📊")
         subject    = f"{gate_emoji} 台股 AI 每日分析報告 — {today_str}"
         html_body = compose_email_html(
             analysis, stocks_data, today_str, market_data,
             us_market=us_market, news_analysis=news_analysis,
-            futures_gate=futures_gate,
+            futures_gate=futures_gate, ctx=ctx,
+            # 即時模式為台北時間的今天；--date 重現時以資料日隔天表示
+            sent_date=(_today() + timedelta(days=1)) if AS_OF else now_tpe(),
         )
+        if args.dry_run:
+            tag = (AS_OF or today.strftime("%Y-%m-%d")) + ("_nollm" if args.no_llm else "")
+            _write_dry_run(args.out, tag, html_body, analysis, ctx)
+            log.info("🎉 dry-run 完成（未寄信、未寫 signals_log）")
+            return
+
         send_email(subject, html_body)
 
         log.info("🎉 今日分析完成！")
@@ -2386,13 +3079,15 @@ def main():
     except json.JSONDecodeError as e:
         err = f"Claude API 回傳格式錯誤（非 JSON）：{e}\n{traceback.format_exc()}"
         log.error(err)
-        send_error_email(err)
+        if not args.dry_run:
+            send_error_email(err)
         sys.exit(1)
 
     except Exception as e:
         err = f"程式執行發生錯誤：{e}\n{traceback.format_exc()}"
         log.error(err)
-        send_error_email(err)
+        if not args.dry_run:
+            send_error_email(err)
         sys.exit(1)
 
 
