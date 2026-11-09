@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 台股 AI 每日分析系統
-每天早上 7:30 自動執行，分析 12 檔台股並寄送 Email 報告
+每天早上自動執行，分析追蹤清單（STOCKS）中的台股並寄送 Email 報告
 """
 
 import os
@@ -111,9 +111,10 @@ BASE_RECOMMEND_SCORE = 7
 MAX_RECOMMEND_SCORE  = 9
 WATCH_MIN_SCORE      = 5
 
-# 台指期夜盤閘門：夜盤收盤 − 前一日結算價（點）
-TX_RED_PTS    = -200
-TX_YELLOW_PTS = -100
+# 台指期夜盤閘門：(夜盤收盤 − 前一日結算價) ÷ 結算價（%）。用百分比而非點數，
+# 門檻不會隨指數水準漂移（指數 48,000 點時 −200 點只有 −0.42%）
+TX_YELLOW_PCT = -0.25
+TX_RED_PCT    = -0.5
 
 # 美股指標閘門：前一晚日漲跌幅（%）
 SOX_YELLOW_PCT  = -2.0
@@ -1042,7 +1043,7 @@ def get_futures_gate() -> dict:
     start = (_today() - timedelta(days=10)).strftime("%Y-%m-%d")
     df = finmind_get("TaiwanFuturesDaily", "TX", start)
 
-    rule = f"≤{TX_YELLOW_PTS}點 黃／≤{TX_RED_PTS}點 紅"
+    rule = f"≤{TX_YELLOW_PCT:g}% 黃／≤{TX_RED_PCT:g}% 紅"
     result = {
         "status":      "green",
         **GATE_STYLE["green"],
@@ -1102,7 +1103,8 @@ def get_futures_gate() -> dict:
         return _missing("台指期收盤價或結算價無效")
 
     diff_pts    = round(night_close - settlement, 0)
-    diff_pct    = round((night_close - settlement) / settlement * 100, 2)
+    raw_pct     = (night_close - settlement) / settlement * 100
+    diff_pct    = round(raw_pct, 2)
 
     result["night_close"]     = night_close
     result["settlement"]      = settlement
@@ -1111,9 +1113,10 @@ def get_futures_gate() -> dict:
     result["night_date"]      = str(after_date)
     result["settlement_date"] = str(settlement_date)
 
-    if diff_pts <= TX_RED_PTS:
+    # 以未四捨五入的百分比判斷，避免顯示值與判斷值在邊界上不一致
+    if raw_pct <= TX_RED_PCT:
         status = "red"
-    elif diff_pts <= TX_YELLOW_PTS:
+    elif raw_pct <= TX_YELLOW_PCT:
         status = "yellow"
     else:
         status = "green"
@@ -1147,26 +1150,36 @@ def get_market_data() -> dict:
         result["error"] = "大盤指數（TAIEX）無資料"
         log.warning(f"⚠️  {result['error']}")
         return result
-    if not {"date", "close", "spread"}.issubset(df.columns):
+    if not {"date", "close"}.issubset(df.columns):
         result["error"] = f"大盤指數資料缺少欄位（現有：{list(df.columns)}）"
         log.warning(f"⚠️  {result['error']}")
         return result
 
     df = df.sort_values("date").reset_index(drop=True)
-    for col in ["close", "spread"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df["close"] = pd.to_numeric(df["close"], errors="coerce")
+    df = df[df["close"] > 0].reset_index(drop=True)
+    if df.empty:
+        result["error"] = "大盤指數（TAIEX）收盤價皆無效"
+        log.warning(f"⚠️  {result['error']}")
+        return result
 
     last_row = df.iloc[-1]
     close_val = float(last_row["close"])
-    # FinMind 的 spread 欄位就是漲跌點數（已含正負號）
-    spread_val = float(last_row.get("spread", 0) or 0)
-    chg_p = round(spread_val / (close_val - spread_val) * 100, 2) if (close_val - spread_val) else 0
+    result["date"]      = str(last_row["date"])
+    result["close"]     = f"{close_val:,.2f}"
+    result["close_val"] = close_val
 
-    result["date"]       = str(last_row["date"])
-    result["close"]      = f"{close_val:,.2f}"
-    result["change"]     = f"{'+' if spread_val >= 0 else ''}{spread_val:,.2f}"
-    result["change_pct"] = f"{'+' if chg_p >= 0 else ''}{chg_p:.2f}%"
-    result["close_val"]  = close_val
+    # 漲跌 = 當日收盤 − 前一交易日收盤，自行計算，不依賴資料源的 spread 欄位
+    # （當日資料未更新完整時 spread 會是 0）
+    if len(df) >= 2:
+        prev_close = float(df["close"].iloc[-2])
+        chg   = close_val - prev_close
+        chg_p = chg / prev_close * 100
+        result["prev_date"]  = str(df["date"].iloc[-2])
+        result["change"]     = f"{'+' if chg >= 0 else ''}{chg:,.2f}"
+        result["change_pct"] = f"{'+' if chg_p >= 0 else ''}{chg_p:.2f}%"
+    else:
+        log.warning("⚠️  大盤指數只有 1 筆，無法計算漲跌")
 
     closes = df["close"].dropna()
     if len(closes) >= TAIEX_MA_DAYS:
@@ -1633,9 +1646,18 @@ def analyze_with_claude(stocks_data: list, market_data: dict,
     risk_facts = build_risk_facts(ctx, scored_by_id, stocks_data)
     threshold  = (ctx or {}).get("threshold", BASE_RECOMMEND_SCORE)
 
+    # 大盤資料日期不一致（其中一邊延遲更新）時，明確告知 LLM 當日資料可能不完整
+    mismatch = [a for a in ((ctx or {}).get("regime") or {}).get("adjustments", [])
+                if a.get("key") == "date_mismatch"]
+    market_caveat = (
+        f"\n⚠️ {mismatch[0]['reason'].rsplit('+', 1)[0]}：當日資料可能不完整，"
+        "撰寫大盤與外資相關文字時須註明，不可當成完整資料下結論"
+        if mismatch else ""
+    )
+
     prompt = f"""你是台股量化分析師，請用繁體中文為以下股票撰寫分析說明，並呼叫 output_analysis 工具。
 
-大盤：加權指數 {market_data.get('close','N/A')} 點，漲跌 {market_data.get('change','N/A')}（{market_data.get('change_pct','N/A')}）
+大盤：加權指數 {market_data.get('close','N/A')} 點（{market_data.get('date','N/A')}），漲跌 {market_data.get('change','N/A')}（{market_data.get('change_pct','N/A')}）{market_caveat}
 
 股票資料（JSON）：
 {json.dumps(stocks_summary, ensure_ascii=False, indent=2)}
@@ -1691,7 +1713,7 @@ def analyze_with_claude(stocks_data: list, market_data: dict,
                         },
                     },
                     "market_summary":        {"type": "string", "description": "大盤概況說明（50字內）"},
-                    "overall_foreign_trend": {"type": "string", "description": "外資在這12檔的整體動向"},
+                    "overall_foreign_trend": {"type": "string", "description": f"外資在這{len(STOCKS)}檔的整體動向"},
                     "risk_warning":          {"type": "string", "description": "今日操作風險提示（150字內），只能依系統提供的今日風控結果撰寫"},
                 },
                 "required": ["stocks", "market_summary", "overall_foreign_trend", "risk_warning"],
